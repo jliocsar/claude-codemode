@@ -1,0 +1,9 @@
+{
+  "extends": "@jliocsar/begone-slop/tsconfig",
+
+  "include": ["*.ts"],
+
+  "compilerOptions": {
+    "types": ["node"]
+  }
+}

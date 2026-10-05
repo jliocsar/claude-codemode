@@ -1,0 +1,21 @@
+{
+  "name": "claude-codemode",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint --type-aware --deny-warnings",
+    "lint:fix": "oxlint --type-aware --fix --deny-warnings",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "typecheck": "tsc -p . && tsc -p codemode",
+    "test": "claude plugin test . && cd codemode && node --test server.spec.ts"
+  },
+  "devDependencies": {
+    "@jliocsar/begone-slop": "0.2.9",
+    "@types/node": "^24",
+    "oxfmt": "^0.62.0",
+    "oxlint": "1.77.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typescript": "7.0.2"
+  }
+}

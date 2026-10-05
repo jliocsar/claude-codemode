@@ -1,0 +1,15 @@
+{
+  "name": "codemode-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test server.spec.ts"
+  },
+  "dependencies": {
+    "secure-exec": "0.2.22",
+    "zod": "4.6.5"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

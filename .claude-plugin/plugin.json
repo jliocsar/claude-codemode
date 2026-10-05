@@ -1,0 +1,5 @@
+{
+  "name": "codemode",
+  "version": "0.1.0",
+  "description": "One `run` tool: the model writes a TypeScript program that calls Claude Code's own tools from a Secure Exec VM."
+}
