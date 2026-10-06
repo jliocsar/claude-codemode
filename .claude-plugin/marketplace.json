@@ -1,0 +1,14 @@
+{
+  "name": "claude-codemode",
+  "description": "Code mode for Claude Code: one run tool in place of every data-moving tool.",
+  "owner": {
+    "name": "jliocsar"
+  },
+  "plugins": [
+    {
+      "name": "codemode",
+      "source": "./",
+      "description": "One `run` tool: the model writes a TypeScript program that calls Claude Code's own tools from a Secure Exec VM."
+    }
+  ]
+}
