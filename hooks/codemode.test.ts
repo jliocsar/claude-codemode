@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
 const ENGINE_ORIGIN = { kind: 'engine' } as const
@@ -34,7 +34,10 @@ test('relayed tools sit behind ToolSearch, conversation tools stay as they were'
   expect(agent.isDeferred).not.toBe(true)
 })
 
-test('executor tools stay with the model, outside run', async ($, on) => {
+test('custom conversation tools stay with the model, outside run', async ($, on) => {
+  mock.env(on, {
+    CLAUDE_CODEMODE_CUSTOM_CONVERSATION_TOOLS: 'mcp__notes__search, mcp__executor__*',
+  })
   on('tool.describe', (_engine, event) => ({ description: event.description }))
   const execute = await $.tool.describe({
     tool: 'mcp__executor__execute',
@@ -42,7 +45,14 @@ test('executor tools stay with the model, outside run', async ($, on) => {
     provider: { plugin: 'mcp:executor', tier: 'user' },
   })
 
+  const notes = await $.tool.describe({
+    tool: 'mcp__notes__search',
+    description: 'Search notes.',
+    provider: { plugin: 'mcp:notes', tier: 'user' },
+  })
+
   expect(execute.isDeferred).not.toBe(true)
+  expect(notes.isDeferred).not.toBe(true)
 })
 
 test('run stays in the prompt list', async ($, on) => {
@@ -58,6 +68,7 @@ test('run stays in the prompt list', async ($, on) => {
 })
 
 test('the deferred tools reminder keeps only tools code mode does not relay', async ($, on) => {
+  mock.env(on, { CLAUDE_CODEMODE_CUSTOM_CONVERSATION_TOOLS: 'mcp__executor__*' })
   on('prompt.attachment', (_engine, event) => ({ text: event.text }))
   const attached = await $.prompt.attachment({
     type: 'deferred_tools_delta',

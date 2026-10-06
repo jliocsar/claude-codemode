@@ -36,7 +36,8 @@ the server's Unix socket with `$.http.fetch({ socketPath })`. Keep stdout for th
 
 - Conversation tools stay outside `run` (`CONVERSATION_TOOLS` in `hooks/register.ts`): Agent,
   AskUserQuestion, Skill, ToolSearch, plan and worktree tools, Workflow. Their output is for the
-  model to read, or they change the session.
+  model to read, or they change the session. `CLAUDE_CODEMODE_CUSTOM_CONVERSATION_TOOLS` adds more
+  (comma separated, trailing `*` matches by prefix, e.g. `mcp__executor__*`).
 - Replace, never duplicate: relayed tools stay registered but are deferred (`tool.describe`) and
   cut from the deferred-tools reminder (`prompt.attachment`). Denying them or `--disallowedTools`
   removes them from the session, and then `$.tool.call` cannot reach them either.

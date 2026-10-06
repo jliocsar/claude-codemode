@@ -45,10 +45,6 @@ const CONVERSATION_TOOLS: ReadonlySet<string> = new Set([
   RUN_TOOL_FULL_NAME,
 ])
 
-// MCP servers the model calls directly, outside `run`: executor evaluates its
-// own TypeScript, so nesting it in `run` only stacks envelopes on each result.
-const DIRECT_TOOL_PREFIXES: readonly string[] = ['mcp__executor__']
-
 const RUN_INPUT_SCHEMA = {
   type: 'object',
   properties: {
@@ -130,27 +126,45 @@ export const register: Register = (on) => {
 
   // `run` in the prompt's list; every relayed tool behind ToolSearch.
   on('tool.describe', async ($, event, next) => {
-    const described = await next(event)
+    const [described, customTools] = await Promise.all([next(event), customConversationTools($)])
 
     if (event.tool === RUN_TOOL_FULL_NAME) {
       return { ...described, isDeferred: false }
     }
 
-    return isRelayedTool(event.tool) ? { ...described, isDeferred: true } : described
+    return isRelayedTool(event.tool, customTools) ? { ...described, isDeferred: true } : described
   })
 
   on('prompt.attachment', { type: 'deferred_tools_delta' }, async ($, event, next) => {
-    const attached = await next(event)
+    const [attached, customTools] = await Promise.all([next(event), customConversationTools($)])
 
     return attached.text === null
       ? attached
-      : { ...attached, text: withoutRelayedToolNames(attached.text) }
+      : { ...attached, text: withoutRelayedToolNames(attached.text, customTools) }
   })
 }
 
-function isRelayedTool(tool: string) {
+// More tools the model calls directly, outside `run`: comma separated names in
+// CLAUDE_CODEMODE_CUSTOM_CONVERSATION_TOOLS, a trailing `*` matching by prefix,
+// e.g. `mcp__executor__*,mcp__fff__grep`.
+async function customConversationTools($: EngineInterface): Promise<readonly string[]> {
+  try {
+    const listed = await $.env.get('CLAUDE_CODEMODE_CUSTOM_CONVERSATION_TOOLS')
+
+    return (listed ?? '').split(',').flatMap((entry) => entry.trim() || [])
+  } catch (cause) {
+    $.ui.log(`codemode: reading custom conversation tools failed: ${errorText(cause)}`)
+
+    return []
+  }
+}
+
+function isRelayedTool(tool: string, customTools: readonly string[]) {
   return (
-    !CONVERSATION_TOOLS.has(tool) && !DIRECT_TOOL_PREFIXES.some((prefix) => tool.startsWith(prefix))
+    !CONVERSATION_TOOLS.has(tool) &&
+    !customTools.some((entry) =>
+      entry.endsWith('*') ? tool.startsWith(entry.slice(0, -1)) : tool === entry,
+    )
   )
 }
 
@@ -159,10 +173,10 @@ function errorText(cause: unknown) {
 }
 
 async function relayedToolCatalog($: EngineInterface) {
-  const sessionTools = await $.tool.list()
+  const [sessionTools, customTools] = await Promise.all([$.tool.list(), customConversationTools($)])
 
   return sessionTools
-    .filter(({ name }) => isRelayedTool(name))
+    .filter(({ name }) => isRelayedTool(name, customTools))
     .map(({ name, description }) => ({ name, description }))
 }
 
@@ -217,7 +231,7 @@ async function* stdoutLines(output: SpawnedOutput) {
 }
 
 async function runRelayedTool($: EngineInterface, { callId, input }: ToolCallLine) {
-  if (!isRelayedTool(input.tool)) {
+  if (!isRelayedTool(input.tool, await customConversationTools($))) {
     return {
       callId,
       outcome: 'denied',
@@ -266,13 +280,13 @@ function isToolNameLine(line: string) {
   return trimmed !== '' && !trimmed.includes(' ')
 }
 
-function withoutRelayedToolNames(reminderText: string) {
+function withoutRelayedToolNames(reminderText: string, customTools: readonly string[]) {
   const keptLines = reminderText
     .split('\n')
     .filter(
       (line) =>
         !isToolNameLine(line) ||
-        (!isRelayedTool(line.trim()) && line.trim() !== RUN_TOOL_FULL_NAME),
+        (!isRelayedTool(line.trim(), customTools) && line.trim() !== RUN_TOOL_FULL_NAME),
     )
 
   return keptLines.some(isToolNameLine) ? keptLines.join('\n') : null
