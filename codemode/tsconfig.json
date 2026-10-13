@@ -4,6 +4,6 @@
   "include": ["*.ts"],
 
   "compilerOptions": {
-    "types": ["node"]
+    "types": ["bun"]
   }
 }

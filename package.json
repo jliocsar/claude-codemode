@@ -8,11 +8,11 @@
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "typecheck": "tsc -p . && tsc -p codemode",
-    "test": "claude plugin test . && cd codemode && node --test server.spec.ts"
+    "test": "claude plugin test . && cd codemode && bun test ./server.spec.ts"
   },
   "devDependencies": {
     "@jliocsar/begone-slop": "0.2.9",
-    "@types/node": "^24",
+    "@types/bun": "^1.4.2",
     "oxfmt": "^0.62.0",
     "oxlint": "1.77.0",
     "oxlint-tsgolint": "^7.0.2001",

@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
 const ENGINE_ORIGIN = { kind: 'engine' } as const
@@ -90,4 +91,18 @@ test('a reminder listing only relayed tools is dropped', async ($, on) => {
   })
 
   expect(attached.text).toBe(null)
+})
+
+test('a run reply with pictures becomes text and image blocks', () => {
+  const plain = runResult({ text: 'done', images: [] })
+  const pictured = runResult({
+    text: '[image 1]',
+    images: [{ mediaType: 'image/png', base64: 'c2hvdA==' }],
+  })
+
+  expect(plain).toBe('done')
+  expect(pictured).toEqual([
+    { type: 'text', text: '[image 1]' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c2hvdA==' } },
+  ])
 })

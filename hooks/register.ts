@@ -1,4 +1,14 @@
 import type { EngineInterface, Register } from 'claude-code'
+import {
+  isRelayedTool,
+  parseServerReply,
+  RUN_INPUT_SCHEMA,
+  RUN_TOOL_DESCRIPTION,
+  RUN_TOOL_FULL_NAME,
+  RUN_TOOL_NAME,
+  runResult,
+  withoutRelayedToolNames,
+} from './run-tool'
 
 // Code mode: one `run` tool replaces every tool that only moves data. The model
 // writes a TypeScript program, the codemode server (codemode/server.ts, a Node
@@ -25,64 +35,9 @@ type SpawnedOutput = ReturnType<EngineInterface['process']['spawn']>
 
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
-const RUN_TOOL_NAME = 'run'
-const RUN_TOOL_FULL_NAME = 'mcp__codemode__run'
-const NPM_ERROR_CHARACTERS = 500
-
-// Tools that act on the conversation itself rather than return data: their
-// output is meant for the model to read, or they change the session's state.
-const CONVERSATION_TOOLS: ReadonlySet<string> = new Set([
-  'Agent',
-  'AskUserQuestion',
-  'EndConversation',
-  'EnterPlanMode',
-  'EnterWorktree',
-  'ExitPlanMode',
-  'ExitWorktree',
-  'Skill',
-  'ToolSearch',
-  'Workflow',
-  RUN_TOOL_FULL_NAME,
-])
-
-const RUN_INPUT_SCHEMA = {
-  type: 'object',
-  properties: {
-    code: {
-      type: 'string',
-      description: 'The body of an async TypeScript function. Use await, and return a JSON value.',
-    },
-    inputs: {
-      type: 'object',
-      description:
-        'Data the code reads as `inputs`: file contents, edit strings, anything with quotes, backticks or backslashes.',
-    },
-  },
-  required: ['code'],
-  additionalProperties: false,
-}
-
-const RUN_TOOL_DESCRIPTION = `Run a TypeScript program against Claude Code's tools in an isolated VM. This is how you read, write and edit files, run shell commands, fetch and search the web, and call MCP servers: those tools are reachable only from here, unless you have them directly.
-
-Loop, branch, batch and filter in one call, and return only what matters. \`code\` is the body of an async function: await the calls and \`return\` a JSON value. You read the value alone (a string as is), then any console.log output; a failed run reads \`run failed: <why>\`.
-
-\`\`\`ts
-declare const tools: {
-  /**
-   * Run one tool by name, e.g. "Read", "Edit", "Bash", "WebFetch", "mcp__<server>__<tool>".
-   * \`result\`: the tool's own record (Read's file, Bash's streams), else \`text\` parsed when JSON, else \`text\`.
-   */
-  call(name: string, input: object): Promise<{ text: string; isError: boolean; result: unknown }>
-  /** Find tools by words in their name or description; each comes with its input type. "" lists them all. */
-  search(query: string): Promise<{ name: string; description: string; input: string }[]>
-}
-declare const inputs: any
-\`\`\`
-
-Search before calling a tool whose input you don't know. Common ones: Read { file_path, offset?, limit? }, Write { file_path, content }, Edit { file_path, old_string, new_string, replace_all? }, Bash { command, timeout? }.
-Put file contents, edit strings and any text with quotes, backticks or backslashes in \`inputs\` and read them as \`inputs.name\`. Never write them inline in \`code\`.
-The VM has no network and no real filesystem: \`tools\` is the only way out, and every call goes through the usual permissions.
-The code is type-checked against each tool's real input type first. A type error comes back without anything running.`
+const INSTALL_ERROR_CHARACTERS = 500
+// Bun.Image, which zooming needs, is in Bun 1.4 on.
+const MINIMUM_BUN_VERSION = [1, 4] as const
 
 export const register: Register = (on) => {
   // Settles once: with the socket path when the server is ready, or with why it never will be.
@@ -104,7 +59,7 @@ export const register: Register = (on) => {
     return started
   })
 
-  on('tool.call', { tool: RUN_TOOL_FULL_NAME }, async ($, event) => {
+  on('tool.call', { tool: RUN_TOOL_FULL_NAME }, async ($, event, next) => {
     const [connection, catalog] = await Promise.all([serverConnection, relayedToolCatalog($)])
 
     if (connection.kind === 'unavailable') {
@@ -112,13 +67,21 @@ export const register: Register = (on) => {
     }
 
     try {
-      const response = await $.http.fetch('http://codemode/run', {
-        method: 'POST',
-        socketPath: connection.socketPath,
-        body: JSON.stringify({ code: event.code, inputs: event.inputs ?? {}, catalog }),
-      })
+      const runJson = JSON.stringify({ code: event.code, inputs: event.inputs ?? {}, catalog })
+      let reply = await askServer($, connection.socketPath, '/run', runJson)
 
-      return { result: response.text }
+      // `$.http.fetch` gives up after 30 s, so a longer run answers with its
+      // id, and the plugin asks again until the reply is in.
+      while (reply.pendingRunId !== undefined) {
+        if (next.signal.aborted) {
+          return { deny: 'run interrupted; its program may still be running' }
+        }
+
+        const waitJson = JSON.stringify({ runId: reply.pendingRunId })
+        reply = await askServer($, connection.socketPath, '/wait', waitJson)
+      }
+
+      return { result: runResult(reply) }
     } catch (cause) {
       return { deny: `codemode server unavailable: ${errorText(cause)}` }
     }
@@ -159,17 +122,24 @@ async function customConversationTools($: EngineInterface): Promise<readonly str
   }
 }
 
-function isRelayedTool(tool: string, customTools: readonly string[]) {
-  return (
-    !CONVERSATION_TOOLS.has(tool) &&
-    !customTools.some((entry) =>
-      entry.endsWith('*') ? tool.startsWith(entry.slice(0, -1)) : tool === entry,
-    )
-  )
-}
-
 function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+// POSTs a run (`/run`) or asks after one (`/wait`); the body is JSON.
+async function askServer(
+  $: EngineInterface,
+  socketPath: string,
+  path: '/run' | '/wait',
+  bodyJson: string,
+) {
+  const response = await $.http.fetch(`http://codemode${path}`, {
+    method: 'POST',
+    socketPath,
+    body: bodyJson,
+  })
+
+  return parseServerReply(response.text)
 }
 
 async function relayedToolCatalog($: EngineInterface) {
@@ -180,24 +150,45 @@ async function relayedToolCatalog($: EngineInterface) {
     .map(({ name, description }) => ({ name, description }))
 }
 
+async function requireBun($: EngineInterface) {
+  const [minimumMajor, minimumMinor] = MINIMUM_BUN_VERSION
+  const needed = `the codemode server needs Bun ${minimumMajor}.${minimumMinor} or later on PATH`
+  let version = ''
+
+  try {
+    const ran = await $.process.run(['bun', '--version'])
+    version = ran.exitCode === 0 ? ran.stdout.trim() : ''
+  } catch {
+    throw new Error(needed)
+  }
+
+  const [major = 0, minor = 0] = version.split('.').map(Number)
+
+  if (major < minimumMajor || (major === minimumMajor && minor < minimumMinor)) {
+    throw new Error(`${needed}; found ${version || 'none'}`)
+  }
+}
+
 // Installs the server's packages on first start, then runs it for the session's life.
 async function runCodemodeServer($: EngineInterface, settle: SettleServerConnection) {
   const serverDirectory = `${$.plugin.root}/codemode`
 
   try {
+    await requireBun($)
+
     if (!(await $.fs.exists(`${serverDirectory}/node_modules/secure-exec`))) {
       $.ui.toast('codemode: installing the server (first start only)')
-      const installed = await $.process.run(['npm', 'install', '--no-audit', '--no-fund'], {
+      const installed = await $.process.run(['bun', 'install', '--frozen-lockfile'], {
         cwd: serverDirectory,
       })
 
       if (installed.exitCode !== 0) {
-        throw new Error(`npm install failed: ${installed.stderr.slice(-NPM_ERROR_CHARACTERS)}`)
+        throw new Error(`bun install failed: ${installed.stderr.slice(-INSTALL_ERROR_CHARACTERS)}`)
       }
     }
 
     let socketPath = ''
-    const serverOutput = $.process.spawn({ argv: ['node', 'server.ts'], cwd: serverDirectory })
+    const serverOutput = $.process.spawn({ argv: ['bun', 'server.ts'], cwd: serverDirectory })
 
     for await (const line of stdoutLines(serverOutput)) {
       // The server prints its ready line before it accepts a run, so every
@@ -270,24 +261,4 @@ async function answerToolCall($: EngineInterface, socketPath: string, toolCallTe
   } catch (cause) {
     $.ui.log(`codemode: answering a tool call failed: ${errorText(cause)}`, { to: 'debug' })
   }
-}
-
-// The reminder lists one deferred tool name per line under a sentence or two
-// of framing. Drops the relayed names, and the whole reminder when none is left.
-function isToolNameLine(line: string) {
-  const trimmed = line.trim()
-
-  return trimmed !== '' && !trimmed.includes(' ')
-}
-
-function withoutRelayedToolNames(reminderText: string, customTools: readonly string[]) {
-  const keptLines = reminderText
-    .split('\n')
-    .filter(
-      (line) =>
-        !isToolNameLine(line) ||
-        (!isRelayedTool(line.trim(), customTools) && line.trim() !== RUN_TOOL_FULL_NAME),
-    )
-
-  return keptLines.some(isToolNameLine) ? keptLines.join('\n') : null
 }

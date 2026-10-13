@@ -1,166 +1,77 @@
-import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { request } from 'node:http'
-import { createInterface } from 'node:readline'
-import { text } from 'node:stream/consumers'
-import { after, test } from 'node:test'
+import { afterAll, expect, test } from 'bun:test'
 import { z } from 'zod'
+import { decodeRgbaPng } from './png.ts'
+import {
+  PDF_PATH,
+  patternPath,
+  patternPixel,
+  run,
+  seenToolCalls,
+  server,
+  SHOT_BASE64,
+  SHOT_PATH,
+  TEST_TIMEOUT_MS,
+  TRICKY_STRING,
+  zoomedSummarySchema,
+} from './spec-harness.ts'
 
-const READY_PREFIX = 'CODEMODE_READY '
-const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
-const TEST_TIMEOUT_MS = 60_000
-const TRICKY_STRING = 'a`b${c}\\d "e" \'f\'\nnext line'
-
-const CATALOG = [
-  { name: 'Read', description: 'Reads a file from the local filesystem.' },
-  { name: 'Edit', description: 'Performs exact string replacements in files.' },
-  { name: 'Bash', description: 'Executes a bash command.' },
-  { name: 'mcp__notes__search', description: 'Search notes by keyword.' },
-]
-
-const toolCallLineSchema = z.object({
-  callId: z.string(),
-  input: z.looseObject({ tool: z.string() }),
-})
-
-const server = spawn('node', ['server.ts'], {
-  cwd: import.meta.dirname,
-  stdio: ['ignore', 'pipe', 'ignore'],
-})
-type ToolCallInput = z.infer<typeof toolCallLineSchema>['input']
-
-const seenToolCalls: ToolCallInput[] = []
-const serverSocketPath = waitForServerSocketPath()
-
-async function post(path: string, bodyJson: string) {
-  const outgoing = request({ socketPath: await serverSocketPath, path, method: 'POST' })
-  const { promise: incoming, resolve, reject } = Promise.withResolvers<NodeJS.ReadableStream>()
-  outgoing.on('response', resolve)
-  outgoing.on('error', reject)
-  outgoing.end(bodyJson)
-
-  return text(await incoming)
-}
-
-// The text the model reads.
-function run(body: { code: string; inputs?: Record<string, string> }) {
-  return post('/run', JSON.stringify({ ...body, catalog: CATALOG }))
-}
-
-// What the engine answers: Bash is denied, the MCP tool's `result` is its text
-// again, Read errors as the engine does (`result` is `text` behind `Error: `),
-// and the rest echo their input as a record.
-function cannedAnswer(callId: string, { tool, ...args }: ToolCallInput) {
-  if (tool === 'Bash') {
-    return { callId, outcome: 'denied', reason: 'not allowed in this test' }
-  }
-
-  if (tool === 'mcp__notes__search') {
-    const notesText = JSON.stringify({ hits: [args['query']] })
-
-    return { callId, outcome: 'answered', text: notesText, isError: false, result: notesText }
-  }
-
-  if (tool === 'Read') {
-    return {
-      callId,
-      outcome: 'answered',
-      text: 'File does not exist.',
-      isError: true,
-      result: 'Error: File does not exist.',
-    }
-  }
-
-  return {
-    callId,
-    outcome: 'answered',
-    text: `ok ${tool}`,
-    isError: false,
-    result: { echoed: args },
-  }
-}
-
-// Stands in for the plugin: answers each tool call with a canned result.
-function answerToolCall(line: string) {
-  const { callId, input } = toolCallLineSchema.parse(JSON.parse(line))
-  seenToolCalls.push(input)
-  void post('/answer', JSON.stringify(cannedAnswer(callId, input)))
-}
-
-function waitForServerSocketPath() {
-  const { promise, resolve, reject } = Promise.withResolvers<string>()
-  server.on('exit', (code) => {
-    reject(new Error(`codemode server exited with ${String(code)}`))
-  })
-  createInterface({ input: server.stdout }).on('line', (line) => {
-    if (line.startsWith(READY_PREFIX)) {
-      resolve(line.slice(READY_PREFIX.length))
-    } else if (line.startsWith(TOOL_CALL_PREFIX)) {
-      answerToolCall(line.slice(TOOL_CALL_PREFIX.length))
-    }
-  })
-
-  return promise
-}
-
-after(() => {
+afterAll(() => {
   server.kill('SIGTERM')
 })
 
-void test(
+test(
   'edit strings from inputs reach the tool byte for byte',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const response = await run({
+    const reply = await run({
       code: 'const edited = await tools.call("Edit", { file_path: "/x.ts", old_string: inputs.old, new_string: "y" })\nreturn edited.result',
       inputs: { old: TRICKY_STRING },
     })
 
-    assert.deepEqual(JSON.parse(response), {
+    expect(JSON.parse(reply.text)).toEqual({
       echoed: { file_path: '/x.ts', old_string: TRICKY_STRING, new_string: 'y' },
     })
 
-    assert.deepEqual(seenToolCalls.at(-1), {
+    expect(seenToolCalls.at(-1)).toEqual({
       tool: 'Edit',
       file_path: '/x.ts',
       old_string: TRICKY_STRING,
       new_string: 'y',
     })
   },
+  TEST_TIMEOUT_MS,
 )
 
-void test(
+test(
   'a type error comes back before anything runs',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
     const toolCallsBefore = seenToolCalls.length
-    const response = await run({ code: 'await tools.call("Read", { file_pth: "/x" })' })
+    const reply = await run({ code: 'await tools.call("Read", { file_pth: "/x" })' })
 
-    assert.match(response, /^run failed: nothing ran[^]*\nline 1: TS\d+ .*file_pth/u)
+    expect(reply.text).toMatch(/^run failed: nothing ran[^]*\nline 1: TS\d+ .*file_pth/u)
 
-    assert.equal(seenToolCalls.length, toolCallsBefore)
+    expect(seenToolCalls.length).toBe(toolCallsBefore)
   },
+  TEST_TIMEOUT_MS,
 )
 
-void test(
+test(
   'a denied tool call rejects inside the program',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const response = await run({
+    const reply = await run({
       code: 'try { await tools.call("Bash", { command: "ls" }); return "ran" } catch (error) { return String(error) }',
     })
 
-    assert.match(response, /^Error: Bash denied: not allowed in this test/u)
+    expect(reply.text).toMatch(/^Error: Bash denied: not allowed in this test/u)
   },
+  TEST_TIMEOUT_MS,
 )
 
-void test(
+test(
   'search finds tools by words, with their input types',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const response = await run({ code: 'return await tools.search("search notes")' })
+    const reply = await run({ code: 'return await tools.search("search notes")' })
 
-    assert.deepEqual(JSON.parse(response), [
+    expect(JSON.parse(reply.text)).toEqual([
       {
         name: 'mcp__notes__search',
         description: 'Search notes by keyword.',
@@ -168,28 +79,94 @@ void test(
       },
     ])
   },
+  TEST_TIMEOUT_MS,
 )
 
-void test(
+test(
   'a tool outside the catalog fails the type check',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const response = await run({
-      code: 'await tools.call("Write", { file_path: "/x", content: "" })',
-    })
+    const reply = await run({ code: 'await tools.call("Write", { file_path: "/x", content: "" })' })
 
-    assert.match(response, /^run failed: [^]*"Write"/u)
+    expect(reply.text).toMatch(/^run failed: [^]*"Write"/u)
   },
+  TEST_TIMEOUT_MS,
 )
 
-void test(
+test(
   'result is the text parsed, never the text again or behind Error:, and stdout follows the value',
-  { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const response = await run({
+    const reply = await run({
       code: 'const found = await tools.call("mcp__notes__search", { query: "x" })\nconst missing = await tools.call("Read", { file_path: "/missing" })\nconsole.log("seen")\nreturn [found.result, missing.isError, missing.result]',
     })
 
-    assert.equal(response, '[{"hits":["x"]},true,"File does not exist."]\n\nstdout:\nseen')
+    expect(reply).toEqual({
+      text: '[{"hits":["x"]},true,"File does not exist."]\n\nstdout:\nseen',
+      images: [],
+    })
   },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  'returned pictures travel as images, PDF pages from their files, one only read stays out',
+  async () => {
+    const returned = await run({
+      code: `const shot = await tools.call("Read", { file_path: "${SHOT_PATH}" })\nconst pdf = await tools.call("Read", { file_path: "${PDF_PATH}", pages: "1-2" })\nreturn { shot: shot.result, pages: pdf.result }`,
+    })
+    const unreturned = await run({
+      code: `const shot = await tools.call("Read", { file_path: "${SHOT_PATH}" })\nreturn shot.isError`,
+    })
+
+    const { shot, pages } = z
+      .object({ shot: z.json(), pages: z.object({ pages: z.json() }) })
+      .parse(JSON.parse(returned.text))
+
+    expect(shot).toEqual({ type: 'image', file: { base64: '[image 1]', type: 'image/png' } })
+    expect(pages.pages).toEqual([
+      { base64: '[image 2]', mediaType: 'image/png' },
+      { base64: '[image 3]', mediaType: 'image/png' },
+    ])
+    expect(returned.images).toEqual([
+      { mediaType: 'image/png', base64: SHOT_BASE64 },
+      { mediaType: 'image/png', base64: btoa('page one') },
+      { mediaType: 'image/png', base64: btoa('page two') },
+    ])
+
+    expect(unreturned).toEqual({ text: 'false', images: [] })
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  'zoom asks Read first, then shows the region at its own pixels',
+  async () => {
+    const reply = await run({
+      code: 'const zoomed = await tools.zoom(inputs.path, { x: 1, y: 0, width: 2, height: 5 })\nreturn { zoomed, region: zoomed.region, size: zoomed.file.dimensions }',
+      inputs: { path: patternPath },
+    })
+
+    expect(seenToolCalls.at(-1)).toEqual({ tool: 'Read', file_path: patternPath })
+
+    expect(reply.images).toHaveLength(1)
+
+    const { region, size } = zoomedSummarySchema.parse(JSON.parse(reply.text))
+    const shown = decodeRgbaPng(Buffer.from(reply.images[0]?.base64 ?? '', 'base64'))
+
+    const shownPixel = (column: number, row: number) => {
+      const start = (row * shown.width + column) * 4
+
+      return [...shown.pixels.subarray(start, start + 4)]
+    }
+
+    expect(region).toEqual({ x: 1, y: 0, width: 2, height: 2 })
+
+    expect([shown.width, shown.height]).toEqual([size.displayWidth, size.displayHeight])
+
+    expect(shown.width).toBe(2000)
+
+    expect(shownPixel(0, 0)).toEqual(patternPixel(1, 0))
+
+    expect(shownPixel(shown.width / region.width, shown.height - 1)).toEqual(patternPixel(2, 1))
+  },
+  TEST_TIMEOUT_MS,
 )

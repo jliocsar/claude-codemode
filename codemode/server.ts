@@ -1,16 +1,14 @@
-// The codemode server: a Node process the plugin spawns once per session. It
+// The codemode server: a Bun process the plugin spawns once per session. It
 // owns one Secure Exec VM, runs the model's programs in it, and relays each
 // `tools.call` back to the plugin, which runs the real Claude Code tool.
 //
 // Protocol: requests to the plugin are stdout lines (the plugin reads the
 // child's stream); everything else goes over a Unix socket the plugin fetches.
+// Every reply over the socket is JSON: `{ text, images }` for a run.
 
-import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { text } from 'node:stream/consumers'
 import { createVm, shutdown } from 'secure-exec'
 import { z } from 'zod'
 import {
@@ -20,54 +18,58 @@ import {
   loadToolInputTypes,
   searchCatalog,
 } from './catalog.ts'
+import {
+  type JsonValue,
+  type ModelImage,
+  takeOutImages,
+  type ZoomRegion,
+  zoomRegionSchema,
+} from './image.ts'
+import {
+  askPluginToRunTool,
+  settleToolCall,
+  toolAnswerSchema,
+  type ToolInput,
+  toolInputSchema,
+  zoomFile,
+} from './relay.ts'
 
 type RunResponse =
-  | { ok: true; value: unknown; stdout: string }
+  | { ok: true; value: JsonValue; stdout: string }
   | { ok: false; feedback: string; stdout: string }
 
 type SucceededRun = Extract<RunResponse, { ok: true }>
 
-type AnsweredToolCall = Extract<ToolAnswer, { outcome: 'answered' }>
+// What the model reads: `text`, then each image in `images` as an image block.
+type RunReply = { text: string; images: ModelImage[] }
+
+// A run still going past REPLY_WAIT_MS: the plugin asks `/wait` for it again.
+type PendingReply = { pendingRunId: string }
 
 const READY_PREFIX = 'CODEMODE_READY '
-const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 
 // Bash's own max timeout, so one long Bash call fits in one host call.
 const HOST_FUNCTION_TIMEOUT_MS = 600_000
 // A knob: the whole program, which may chain several long calls.
 const RUN_TIMEOUT_MS = 1_800_000
+// `$.http.fetch` gives up on a request after 30 s, so no reply waits longer.
+const REPLY_WAIT_MS = Number(Bun.env['CODEMODE_REPLY_WAIT_MS'] ?? 20_000)
 const PARENT_CHECK_INTERVAL_MS = 5_000
 
 // What the program sees as `tools`, over the frozen `codemode` host collection.
 const GUEST_PRELUDE =
-  'const tools = { call: (name, input) => codemode.call({ name, input }), search: (query) => codemode.search({ query }) };'
+  'const tools = { call: (name, input) => codemode.call({ name, input }), search: (query) => codemode.search({ query }), zoom: (filePath, region) => codemode.zoom({ filePath, region }) };'
 
-// Host function schemas reject `z.unknown()`; a loose object takes any fields.
-const toolInputSchema = z.looseObject({})
 const runRequestSchema = z.object({
   code: z.string(),
   inputs: z.record(z.string(), z.json()).optional(),
   catalog: z.array(catalogEntrySchema),
 })
-const toolAnswerSchema = z.discriminatedUnion('outcome', [
-  z.object({
-    callId: z.string(),
-    outcome: z.literal('answered'),
-    text: z.string(),
-    isError: z.boolean(),
-    result: z.json(),
-  }),
-  z.object({ callId: z.string(), outcome: z.enum(['denied', 'failed']), reason: z.string() }),
-])
+const waitRequestSchema = z.object({ runId: z.string() })
+const jsonValueSchema = z.json()
 
-type ToolInput = z.infer<typeof toolInputSchema>
-type ToolAnswer = z.infer<typeof toolAnswerSchema>
 type RunInputs = NonNullable<z.infer<typeof runRequestSchema>['inputs']>
 
-// What the engine's `result` is when it only repeats `text`: see structuredResult.
-const echoedResultSchema = z.string().nullable()
-
-const pendingToolCalls = new Map<string, (answer: ToolAnswer) => void>()
 const toolInputTypes = await loadToolInputTypes()
 
 const vm = await createVm({
@@ -87,6 +89,13 @@ const vm = await createVm({
         execute: ({ query }: { query: string }) =>
           searchCatalog(catalogOfCurrentRun, toolInputTypes, query),
       },
+      zoom: {
+        inputSchema: z
+          .object({ filePath: z.string(), region: zoomRegionSchema })
+          .describe('Zoom into part of an image file at its own pixels.'),
+        execute: ({ filePath, region }: { filePath: string; region: ZoomRegion }) =>
+          zoomFile(filePath, region),
+      },
     },
   },
   limits: {
@@ -97,67 +106,68 @@ const vm = await createVm({
   },
 })
 
-const server = createServer((request, response) => {
-  void answerRequest(request, response)
-})
-
 // A short path in a private directory: Unix socket paths cap near 100 bytes.
 const socketDirectory = await mkdtemp(join(tmpdir(), 'codemode-'))
 const socketPath = join(socketDirectory, 'run.sock')
 const parentProcessId = process.ppid
+// Each run's reply by id, from `/run` until a reply hands it over.
+const runReplies = new Map<string, Promise<RunReply>>()
 
-async function askPluginToRunTool(tool: string, input: ToolInput) {
-  const callId = randomUUID()
-  const { promise: answered, resolve } = Promise.withResolvers<ToolAnswer>()
-  pendingToolCalls.set(callId, resolve)
-  process.stdout.write(
-    `${TOOL_CALL_PREFIX}${JSON.stringify({ callId, input: { ...input, tool } })}\n`,
-  )
-  const answer = await answered
+const server = Bun.serve({
+  // No idle timeout on a Unix socket: the plugin's fetch waits out a long run.
+  unix: socketPath,
+  routes: {
+    '/run': {
+      POST: async (request) => {
+        const { code, inputs = {}, catalog } = runRequestSchema.parse(await request.json())
+        const runId = crypto.randomUUID()
+        runReplies.set(runId, runAfterPreviousRuns(code, inputs, catalog))
 
-  if (answer.outcome === 'answered') {
-    return {
-      text: answer.text,
-      isError: answer.isError,
-      result: structuredResult(answer),
-    }
-  }
+        return Response.json(await replyWithin(runId))
+      },
+    },
+    '/wait': {
+      POST: async (request) => {
+        const { runId } = waitRequestSchema.parse(await request.json())
 
-  throw new Error(`${tool} ${answer.outcome}: ${answer.reason}`)
-}
+        return Response.json(await replyWithin(runId))
+      },
+    },
+    '/answer': {
+      POST: async (request) => {
+        settleToolCall(toolAnswerSchema.parse(await request.json()))
 
-// The engine's `result` is the tool's own record for built-ins (Read's file,
-// Bash's streams). For MCP tools it is only `text` again, and for an errored
-// call `text` behind an `Error: ` prefix; then it is `text`, parsed when JSON.
-function structuredResult(answer: AnsweredToolCall) {
-  return echoedResultSchema.safeParse(answer.result).success
-    ? (parsedJson(answer.text) ?? answer.text)
-    : answer.result
-}
+        return Response.json({})
+      },
+    },
+  },
+  error: (cause) =>
+    Response.json(
+      { text: `codemode server error: ${String(cause)}`, images: [] } satisfies RunReply,
+      { status: 500 },
+    ),
+})
 
-function parsedJson(jsonText: string) {
-  try {
-    const parsed: unknown = JSON.parse(jsonText)
-
-    return parsed
-  } catch {
-    return undefined
-  }
-}
-
-// What the model reads: the returned value alone (a string as is), or why the
-// run failed, then any console output.
-function runResultText(response: RunResponse) {
-  const body = response.ok ? returnedValueText(response) : `run failed: ${response.feedback}`
+// What the model reads: the returned value alone (a string as is), its
+// pictures as `[image N]` with the images after, or why the run failed; then
+// any console output.
+function runReply(response: RunResponse): RunReply {
+  const { text, images } = response.ok
+    ? returnedValueReply(response)
+    : { text: `run failed: ${response.feedback}`, images: [] }
   const stdout = response.stdout.trimEnd()
 
-  return stdout === '' ? body : `${body}\n\nstdout:\n${stdout}`
+  return { text: stdout === '' ? text : `${text}\n\nstdout:\n${stdout}`, images }
 }
 
-function returnedValueText(response: SucceededRun) {
-  const returnedString = z.string().safeParse(response.value)
+function returnedValueReply(response: SucceededRun): RunReply {
+  const { value, images } = takeOutImages(response.value)
+  const returnedString = z.string().safeParse(value)
 
-  return returnedString.success ? returnedString.data : JSON.stringify(response.value ?? null)
+  return {
+    text: returnedString.success ? returnedString.data : JSON.stringify(value),
+    images,
+  }
 }
 
 async function runProgram(
@@ -198,7 +208,10 @@ async function runProgram(
   })
 
   if (ran.outcome === 'succeeded') {
-    return { ok: true, value: ran.value ?? null, stdout: ran.stdout ?? '' }
+    // As JSON, the way the model reads it: `undefined` and functions drop out.
+    const value = jsonValueSchema.parse(JSON.parse(JSON.stringify(ran.value ?? null)))
+
+    return { ok: true, value, stdout: ran.stdout ?? '' }
   }
 
   const stderr = ran.stderr ?? ''
@@ -210,48 +223,51 @@ async function runProgram(
   }
 }
 
+// The run's reply once it finishes, or its id when REPLY_WAIT_MS passes first.
+async function replyWithin(runId: string): Promise<RunReply | PendingReply> {
+  const reply = runReplies.get(runId)
+
+  if (reply === undefined) {
+    return { text: `codemode server error: no run ${runId}`, images: [] }
+  }
+
+  const { promise: waited, resolve: stopWaiting } = Promise.withResolvers<undefined>()
+  const waitTimer = setTimeout(stopWaiting, REPLY_WAIT_MS, undefined)
+  const finishedReply = await Promise.race([reply, waited])
+  clearTimeout(waitTimer)
+
+  if (finishedReply === undefined) {
+    return { pendingRunId: runId }
+  }
+
+  runReplies.delete(runId)
+
+  return finishedReply
+}
+
 // One program at a time: the VM is shared, and parallel runs would interleave.
 async function runAfterPreviousRuns(
   code: string,
   inputs: RunInputs,
   catalog: readonly CatalogEntry[],
-) {
+): Promise<RunReply> {
   const previousRunsFinished = runQueue
   const { promise: thisRunFinished, resolve: finishThisRun } = Promise.withResolvers<void>()
   runQueue = thisRunFinished
   await previousRunsFinished
 
   try {
-    return await runProgram(code, inputs, catalog)
+    return runReply(await runProgram(code, inputs, catalog))
+  } catch (cause) {
+    // Caught here: nobody may be waiting on the reply when it fails.
+    return { text: `codemode server error: ${String(cause)}`, images: [] }
   } finally {
     finishThisRun()
   }
 }
 
-async function answerRequest(request: IncomingMessage, response: ServerResponse) {
-  try {
-    const body: unknown = JSON.parse(await text(request))
-
-    if (request.url === '/run') {
-      const { code, inputs = {}, catalog } = runRequestSchema.parse(body)
-      response.end(runResultText(await runAfterPreviousRuns(code, inputs, catalog)))
-    } else if (request.url === '/answer') {
-      const answer = toolAnswerSchema.parse(body)
-      pendingToolCalls.get(answer.callId)?.(answer)
-      pendingToolCalls.delete(answer.callId)
-      response.end('{}')
-    } else {
-      response.statusCode = 404
-      response.end('{}')
-    }
-  } catch (cause) {
-    response.statusCode = 500
-    response.end(`codemode server error: ${String(cause)}`)
-  }
-}
-
 async function stop() {
-  server.close()
+  await server.stop(true)
   await rm(socketDirectory, { recursive: true, force: true })
   await shutdown()
   process.exit(0)
@@ -275,6 +291,4 @@ setInterval(() => {
   }
 }, PARENT_CHECK_INTERVAL_MS).unref()
 
-server.listen(socketPath, () => {
-  process.stdout.write(`${READY_PREFIX}${socketPath}\n`)
-})
+process.stdout.write(`${READY_PREFIX}${socketPath}\n`)
