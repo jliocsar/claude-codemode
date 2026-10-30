@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "oxlint --type-aware --deny-warnings",
-    "lint:fix": "oxlint --type-aware --fix --deny-warnings",
-    "fmt": "oxfmt",
-    "fmt:check": "oxfmt --check",
+    "lint": "oxlint --type-aware --deny-warnings --disable-nested-config",
+    "lint:fix": "oxlint --type-aware --fix --deny-warnings --disable-nested-config",
+    "fmt": "oxfmt --disable-nested-config",
+    "fmt:check": "oxfmt --check --disable-nested-config",
     "typecheck": "tsc -p . && tsc -p codemode",
     "test": "claude plugin test . && cd codemode && bun test ./server.spec.ts"
   },
