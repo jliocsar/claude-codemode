@@ -23,6 +23,7 @@ codemode/server.spec.ts      # `bun test`; spec-harness.ts spawns the real serve
 codemode/package.json        # runtime deps only (secure-exec, zod), `bun install`ed on first session start
 package.json                 # dev tooling only: oxlint, oxfmt, begone-slop, typescript, @types/bun
 .githooks/                   # pre-commit and pre-push, wired by `prepare`
+.claude/settings.json        # developing this repo only: refuses Bash commands that skip the hooks
 ```
 
 ## Two runtimes
@@ -103,6 +104,11 @@ an empty `HOME`, no environment and no network (measured), so the hook runs all 
 the plugin without `.git`, where `git config` fails, and a copy inside someone else's repo must not
 repoint that repo's hooks. In a linked worktree `git config` writes the config it shares with the
 main checkout, so install there with `--ignore-scripts` to leave the setting alone.
+
+A Claude Code hook refuses the Bash commands that skip them: `--no-verify` and its abbreviations,
+`git commit -n`, and changing `core.hooksPath`. It drops quoted text first, so a commit message
+mentioning a flag passes. It is project settings under `.claude/`, never a plugin hook: `hooks/` and
+`.claude-plugin/` are what the plugin ships to other people's sessions.
 
 `.claude/worktrees/` is gitignored because oxlint and oxfmt walk into it otherwise, and a worktree's
 files would fail the main checkout's push (measured). `claude plugin test` skips it either way.
