@@ -84,6 +84,13 @@ claude --plugin-dir .                      # load it in a session
 
 `claude` may be a shell alias; scripts should call the binary on `PATH`.
 
+Installs wait three days for a new release, set in `.npmrc` as `min-release-age`. A version an exact
+pin asks for fails with `ETARGET`, and a young optional dependency is skipped with no error. A
+lockfile's entries aren't re-checked, so `npm ci` and a plain `npm install` keep working. A bump you
+mean to make passes `--min-release-age=0` or `--before=<date>` once (all measured on npm 11.20.0).
+npm 10.9.2 reads the setting and installs the young version anyway, so the guard needs a recent npm
+to hold but nothing breaks without one (measured).
+
 ## Lint
 
 `.oxlintrc.json` extends `@jliocsar/begone-slop`'s preset; read the preset and its README rather
