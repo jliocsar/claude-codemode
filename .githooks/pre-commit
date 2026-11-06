@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# Format then lint staged files, then typecheck. The formatter runs first, since
+# formatting moves line breaks the lint rules judge.
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx|json)$' || true)
+
+if [ -n "$staged" ]; then
+  printf '%s\n' "$staged" | xargs node_modules/.bin/oxfmt --disable-nested-config --no-error-on-unmatched-pattern || exit 1
+  printf '%s\n' "$staged" | xargs node_modules/.bin/oxlint --type-aware --fix --deny-warnings --no-error-on-unmatched-pattern --disable-nested-config || exit 1
+  git update-index --again
+fi
+
+npm run typecheck || exit 1

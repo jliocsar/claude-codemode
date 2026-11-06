@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Whole-repo pass, then both test suites: catches drift on files the staged pass
+# never saw. The hooks suite needs `claude` on PATH but no login, network or session.
+
+npm run lint || exit 1
+npm run fmt:check || exit 1
+npm test || exit 1

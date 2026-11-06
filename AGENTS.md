@@ -22,6 +22,7 @@ codemode/catalog.ts          # tool input types from the generated d.ts, type-ch
 codemode/server.spec.ts      # `bun test`; spec-harness.ts spawns the real server and plays the plugin
 codemode/package.json        # runtime deps only (secure-exec, zod), `bun install`ed on first session start
 package.json                 # dev tooling only: oxlint, oxfmt, begone-slop, typescript, @types/bun
+.githooks/                   # pre-commit and pre-push, wired by `prepare`
 ```
 
 ## Two runtimes
@@ -90,6 +91,26 @@ lockfile's entries aren't re-checked, so `npm ci` and a plain `npm install` keep
 mean to make passes `--min-release-age=0` or `--before=<date>` once (all measured on npm 11.20.0).
 npm 10.9.2 reads the setting and installs the young version anyway, so the guard needs a recent npm
 to hold but nothing breaks without one (measured).
+
+## Git hooks
+
+Plain scripts in `.githooks`, and `prepare` points `core.hooksPath` at them. Formatting, lint on
+staged files and the typecheck run on commit; the whole repo's lint, the format check and both test
+suites run on push. `claude plugin test` needs `claude` on `PATH` and nothing else: it passed with
+an empty `HOME`, no environment and no network (measured), so the hook runs all of `npm test`.
+
+`prepare` sets the path only when `.git` sits beside `package.json`. A marketplace install copies
+the plugin without `.git`, where `git config` fails, and a copy inside someone else's repo must not
+repoint that repo's hooks. In a linked worktree `git config` writes the config it shares with the
+main checkout, so install there with `--ignore-scripts` to leave the setting alone.
+
+`.claude/worktrees/` is gitignored because oxlint and oxfmt walk into it otherwise, and a worktree's
+files would fail the main checkout's push (measured). `claude plugin test` skips it either way.
+
+A fresh checkout has no `.claude-plugin/types/` until Claude Code loads the plugin from it, so the
+typecheck fails there. It passes `--noEmit` because that missing config is what carries `noEmit`:
+without the flag `tsc` wrote a `.js` beside every source, and a server spec failed until they were
+gone (measured).
 
 ## Lint
 

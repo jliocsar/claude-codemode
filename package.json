@@ -3,11 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prepare": "test ! -e .git || git config core.hooksPath .githooks",
     "lint": "oxlint --type-aware --deny-warnings --disable-nested-config",
     "lint:fix": "oxlint --type-aware --fix --deny-warnings --disable-nested-config",
     "fmt": "oxfmt --disable-nested-config",
     "fmt:check": "oxfmt --check --disable-nested-config",
-    "typecheck": "tsc -p . && tsc -p codemode",
+    "typecheck": "tsc -p . --noEmit && tsc -p codemode --noEmit",
     "test": "claude plugin test . && cd codemode && bun test ./server.spec.ts"
   },
   "devDependencies": {
