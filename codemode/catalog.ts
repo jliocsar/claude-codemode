@@ -65,22 +65,33 @@ function parseToolInputTypes(declarationText: string, interfaceName: string) {
   return parsedToolInputTypes
 }
 
-export async function loadToolInputTypes(): Promise<ReadonlyMap<string, string>> {
+// The input types as the generated files have them now: read again whenever
+// one changed, as when an MCP server connects after the session started.
+export async function currentToolInputTypes(): Promise<ReadonlyMap<string, string>> {
+  const files = TOOL_TYPE_FILES.map((typeFile) => ({
+    ...typeFile,
+    file: Bun.file(new URL(typeFile.path, import.meta.url)),
+  }))
+  const stamp = files.map(({ file }) => file.lastModified).join(',')
+
+  if (loadedToolInputTypes?.stamp === stamp) {
+    return loadedToolInputTypes.types
+  }
+
   const loaded = await Promise.all(
-    TOOL_TYPE_FILES.map(async ({ path, interfaceName }) => {
-      const declarationText = await readDeclarationText(path)
-
-      return [...parseToolInputTypes(declarationText, interfaceName)]
-    }),
+    files.map(async ({ file, interfaceName }) => [
+      ...parseToolInputTypes(await readDeclaration(file), interfaceName),
+    ]),
   )
+  loadedToolInputTypes = { stamp, types: new Map(loaded.flat()) }
 
-  return new Map(loaded.flat())
+  return loadedToolInputTypes.types
 }
 
 // Missing until Claude Code has loaded the plugin once; every tool is untyped then.
-async function readDeclarationText(path: string) {
+async function readDeclaration(file: Blob) {
   try {
-    return await Bun.file(new URL(path, import.meta.url)).text()
+    return await file.text()
   } catch {
     return ''
   }
@@ -105,6 +116,7 @@ export function buildTypeCheckPrelude(
     '  call<Name extends keyof ToolInputs>(name: Name, input: ToolInputs[Name]): Promise<ToolResult>',
     '  search(query: string): Promise<FoundTool[]>',
     '  zoom(filePath: string, region: ImageRegion): Promise<ZoomedImage>',
+    '  stopRun(runId: string): Promise<boolean>',
     '}',
     'declare const inputs: any',
     'async function run() {',
@@ -118,9 +130,13 @@ export function searchCatalog(
   query: string,
 ) {
   const words = query.toLowerCase().split(/\s+/u).filter(Boolean)
-  const matches = catalog.filter(({ name, description }) =>
-    words.every((word) => `${name} ${description}`.toLowerCase().includes(word)),
-  )
+  const matches = catalog
+    .filter(({ name, description }) =>
+      words.every((word) => `${name} ${description}`.toLowerCase().includes(word)),
+    )
+    .map((entry) => ({ entry, score: searchScore(entry.name, words) }))
+    .toSorted((left, right) => right.score - left.score)
+    .map(({ entry }) => entry)
 
   // An empty query lists every tool, as `run`'s description promises; words cap the hits.
   return (words.length === 0 ? matches : matches.slice(0, SEARCH_RESULT_LIMIT)).map(
@@ -131,3 +147,21 @@ export function searchCatalog(
     }),
   )
 }
+
+// Tools whose name holds the words rank first, the whole name (or its part
+// after the server) above a piece of it; ties keep the session's order.
+function searchScore(name: string, words: readonly string[]) {
+  const lowerName = name.toLowerCase()
+  const shortName = lowerName.split('__').at(-1) ?? lowerName
+
+  return words.reduce((score, word) => {
+    if (word === lowerName || word === shortName) {
+      return score + 100
+    }
+
+    return lowerName.includes(word) ? score + 10 : score
+  }, 0)
+}
+
+// What currentToolInputTypes read last, and the files' modified times then.
+let loadedToolInputTypes: { stamp: string; types: ReadonlyMap<string, string> } | undefined

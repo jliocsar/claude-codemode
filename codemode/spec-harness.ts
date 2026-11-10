@@ -11,12 +11,18 @@ import { encodeRgbaPng } from './png.ts'
 
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
+const SLOW_ANSWER_MS = 500
 
 export const TEST_TIMEOUT_MS = 60_000
 export const TRICKY_STRING = 'a`b${c}\\d "e" \'f\'\nnext line'
 export const SHOT_PATH = '/shot.png'
 export const SHOT_BASE64 = 'c2hvdA=='
 export const PDF_PATH = '/doc.pdf'
+export const BIG_PATH = '/big.txt'
+export const BIG_LINES = Array.from({ length: 4500 }, (_line, index) => `line ${index + 1}`)
+export const SLOW_QUERY = 'slow'
+export const STUCK_QUERY = 'stuck'
+export const WHOLE_OUTPUT = 'the whole output, past the preview'
 
 const CATALOG = [
   { name: 'Read', description: 'Reads a file from the local filesystem.' },
@@ -28,6 +34,11 @@ const CATALOG = [
 // A 4×2 picture, each pixel its own color (patternPixel).
 const PATTERN = { width: 4, height: 2 }
 
+const readyLineSchema = z.object({ socketPath: z.string(), pid: z.number() })
+const readPageSchema = z.looseObject({
+  offset: z.number().optional(),
+  limit: z.number().optional(),
+})
 const toolCallLineSchema = z.object({
   callId: z.string(),
   input: z.looseObject({ tool: z.string() }),
@@ -54,6 +65,17 @@ await Bun.write(patternPath, encodeRgbaPng({ ...PATTERN, pixels: patternPixels()
 await Bun.write(join(fixtureDirectory, 'page-2.png'), 'page two')
 await Bun.write(join(fixtureDirectory, 'page-1.png'), 'page one')
 
+// Where the engine saves an output too long to show: under its config's projects.
+const toolResultsDirectory = join(
+  fixtureDirectory,
+  'projects',
+  'project',
+  'session',
+  'tool-results',
+)
+const persistedOutputPath = join(toolResultsDirectory, 'output.txt')
+await Bun.write(persistedOutputPath, WHOLE_OUTPUT)
+
 const SHOT_RECORD = { type: 'image', file: { base64: SHOT_BASE64, type: 'image/png' } }
 
 const READ_RESULTS = new Map<string, JsonValue>([
@@ -67,7 +89,13 @@ export const server = Bun.spawn(['bun', 'server.ts'], {
   stdout: 'pipe',
   stderr: 'ignore',
   // Short, so every run (a type check alone is ~1.5 s) goes through `/wait`.
-  env: { ...Bun.env, CODEMODE_REPLY_WAIT_MS: '100' },
+  // Short host waits too, so a slow tool call takes several rounds.
+  env: {
+    ...Bun.env,
+    CODEMODE_REPLY_WAIT_MS: '100',
+    CODEMODE_HOST_WAIT_MS: '100',
+    CLAUDE_CONFIG_DIR: fixtureDirectory,
+  },
 })
 export const seenToolCalls: ToolCallInput[] = []
 const serverSocketPath = waitForServerSocketPath()
@@ -84,7 +112,7 @@ function patternPixels() {
   )
 }
 
-async function post(path: string, bodyJson: string) {
+export async function post(path: string, bodyJson: string) {
   const response = await fetch(`http://codemode${path}`, {
     unix: await serverSocketPath,
     method: 'POST',
@@ -95,9 +123,12 @@ async function post(path: string, bodyJson: string) {
 }
 
 // What the model reads: the text, and the images after it.
-export async function run(body: { code: string; inputs?: Record<string, string> }) {
+export async function run(
+  body: { code: string; inputs?: Record<string, string> },
+  runId = crypto.randomUUID(),
+) {
   let reply = serverReplySchema.parse(
-    await post('/run', JSON.stringify({ ...body, catalog: CATALOG })),
+    await post('/run', JSON.stringify({ ...body, runId, catalog: CATALOG })),
   )
 
   while (reply.pendingRunId !== undefined) {
@@ -113,8 +144,18 @@ export async function run(body: { code: string; inputs?: Record<string, string> 
 // again, Read hands back READ_RESULTS and errors elsewhere as the engine does
 // (`result` is `text` behind `Error: `); the rest echo their input as a record.
 function cannedAnswer(callId: string, { tool, ...args }: ToolCallInput) {
+  if (tool === 'Bash' && args['command'] === 'long') {
+    const result = { stdout: 'preview', stderr: '', persistedOutputPath }
+
+    return { callId, outcome: 'answered', text: 'preview', isError: false, result }
+  }
+
   if (tool === 'Bash') {
     return { callId, outcome: 'denied', reason: 'not allowed in this test' }
+  }
+
+  if (tool === 'Read' && args['file_path'] === BIG_PATH) {
+    return bigFileAnswer(callId, readPageSchema.parse(args))
   }
 
   if (tool === 'mcp__notes__search') {
@@ -148,11 +189,49 @@ function cannedAnswer(callId: string, { tool, ...args }: ToolCallInput) {
   }
 }
 
-// Stands in for the plugin: answers each tool call with a canned result.
+// Read past its size cap: an error for the whole file, a page of it with
+// offset and limit, as the engine does.
+function bigFileAnswer(callId: string, { offset, limit }: z.infer<typeof readPageSchema>) {
+  if (offset === undefined || limit === undefined) {
+    const text =
+      'File content (300KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file.'
+
+    return { callId, outcome: 'answered', text, isError: true, result: `Error: ${text}` }
+  }
+
+  const lines = BIG_LINES.slice(offset - 1, offset - 1 + limit)
+  const file = {
+    filePath: BIG_PATH,
+    content: lines.join('\n'),
+    numLines: lines.length,
+    startLine: offset,
+    totalLines: BIG_LINES.length,
+  }
+
+  return {
+    callId,
+    outcome: 'answered',
+    text: 'page',
+    isError: false,
+    result: { type: 'text', file },
+  }
+}
+
+// Stands in for the plugin: answers each tool call with a canned result, a
+// slow query after a while and a stuck one never.
 function answerToolCall(line: string) {
   const { callId, input } = toolCallLineSchema.parse(JSON.parse(line))
   seenToolCalls.push(input)
-  void post('/answer', JSON.stringify(cannedAnswer(callId, input)))
+  const answerJson = JSON.stringify(cannedAnswer(callId, input))
+
+  if (input['query'] === STUCK_QUERY) {
+    return
+  }
+
+  setTimeout(
+    () => void post('/answer', answerJson),
+    input['query'] === SLOW_QUERY ? SLOW_ANSWER_MS : 0,
+  )
 }
 
 // Reads the server's stdout for the test's life: the ready line settles the
@@ -169,7 +248,7 @@ function waitForServerSocketPath() {
 
       for (const line of lines) {
         if (line.startsWith(READY_PREFIX)) {
-          resolve(line.slice(READY_PREFIX.length))
+          resolve(readyLineSchema.parse(JSON.parse(line.slice(READY_PREFIX.length))).socketPath)
         } else if (line.startsWith(TOOL_CALL_PREFIX)) {
           answerToolCall(line.slice(TOOL_CALL_PREFIX.length))
         }

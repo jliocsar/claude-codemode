@@ -21,8 +21,9 @@ const PAGE_FILES = new Bun.Glob('page-*.{jpg,jpeg,png}')
 const ZOOMED_MEDIA_TYPE = 'image/png'
 
 const jsonValueSchema = z.json()
-const jsonArraySchema = z.array(jsonValueSchema)
-const jsonObjectSchema = z.record(z.string(), jsonValueSchema)
+
+// The two records pictures travel in, told apart by `type` before a full parse.
+const PICTURE_RECORD_TYPES: ReadonlySet<JsonValue> = new Set(['image', 'parts'])
 
 export const zoomRegionSchema = z.object({
   x: z.int().min(0),
@@ -95,7 +96,9 @@ export function takeOutImages(value: JsonValue) {
     return `[image ${images.length}]`
   }
 
-  const walk = (node: JsonValue): JsonValue => {
+  // A picture record only where `type` says so: a full parse of every node
+  // would walk each subtree once per level above it.
+  const takeOutPictures = (node: JsonValue) => {
     const image = imageRecordSchema.safeParse(node)
 
     if (image.success) {
@@ -109,32 +112,34 @@ export function takeOutImages(value: JsonValue) {
 
     const pageImages = pageImagesRecordSchema.safeParse(node)
 
-    if (pageImages.success) {
-      return {
-        ...pageImages.data,
-        pages: pageImages.data.pages.map((page) =>
-          page.base64 === ''
-            ? page
-            : { ...page, base64: takeOut({ mediaType: page.mediaType, base64: page.base64 }) },
-        ),
-      }
+    return pageImages.success
+      ? {
+          ...pageImages.data,
+          pages: pageImages.data.pages.map((page) =>
+            page.base64 === ''
+              ? page
+              : { ...page, base64: takeOut({ mediaType: page.mediaType, base64: page.base64 }) },
+          ),
+        }
+      : undefined
+  }
+
+  const walk = (node: JsonValue): JsonValue => {
+    if (Array.isArray(node)) {
+      return node.map(walk)
     }
 
-    const array = jsonArraySchema.safeParse(node)
-
-    if (array.success) {
-      return array.data.map(walk)
+    if (node === null || !(node instanceof Object)) {
+      return node
     }
 
-    const object = jsonObjectSchema.safeParse(node)
+    const pictured = PICTURE_RECORD_TYPES.has(node['type'] ?? null)
+      ? takeOutPictures(node)
+      : undefined
 
-    if (object.success) {
-      return Object.fromEntries(
-        Object.entries(object.data).map(([key, child]) => [key, walk(child)]),
-      )
-    }
-
-    return node
+    return (
+      pictured ?? Object.fromEntries(Object.entries(node).map(([key, child]) => [key, walk(child)]))
+    )
   }
 
   return { value: walk(value), images }

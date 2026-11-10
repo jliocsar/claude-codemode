@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { runResult } from './run-tool'
+import { finishedBackgroundRunText, runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
 const ENGINE_ORIGIN = { kind: 'engine' } as const
@@ -105,4 +105,15 @@ test('a run reply with pictures becomes text and image blocks', () => {
     { type: 'text', text: '[image 1]' },
     { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c2hvdA==' } },
   ])
+})
+
+test('a background run comes back as a message, counting the pictures it cannot carry', () => {
+  const message = finishedBackgroundRunText('run-1', {
+    text: 'built',
+    images: [{ mediaType: 'image/png', base64: 'c2hvdA==' }],
+  })
+
+  expect(message).toMatch(
+    /^codemode: background run run-1 finished\.\n\nbuilt\n\n\(1 returned picture/u,
+  )
 })

@@ -2,7 +2,10 @@ import { afterAll, expect, test } from 'bun:test'
 import { z } from 'zod'
 import { decodeRgbaPng } from './png.ts'
 import {
+  BIG_LINES,
+  BIG_PATH,
   PDF_PATH,
+  post,
   patternPath,
   patternPixel,
   run,
@@ -10,8 +13,11 @@ import {
   server,
   SHOT_BASE64,
   SHOT_PATH,
+  SLOW_QUERY,
+  STUCK_QUERY,
   TEST_TIMEOUT_MS,
   TRICKY_STRING,
+  WHOLE_OUTPUT,
   zoomedSummarySchema,
 } from './spec-harness.ts'
 
@@ -167,6 +173,85 @@ test(
     expect(shownPixel(0, 0)).toEqual(patternPixel(1, 0))
 
     expect(shownPixel(shown.width / region.width, shown.height - 1)).toEqual(patternPixel(2, 1))
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  'a tool call slower than a host wait round still answers, and runs go side by side',
+  async () => {
+    const slowCall = `const found = await tools.call("mcp__notes__search", { query: "${SLOW_QUERY}" })\nreturn found.result`
+    const startedAt = performance.now()
+    const replies = await Promise.all([run({ code: slowCall }), run({ code: slowCall })])
+
+    expect(replies.map(({ text }) => text)).toEqual([
+      `{"hits":["${SLOW_QUERY}"]}`,
+      `{"hits":["${SLOW_QUERY}"]}`,
+    ])
+
+    expect(performance.now() - startedAt).toBeLessThan(TEST_TIMEOUT_MS)
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  'a stopped run fails its waiting tool call and ends',
+  async () => {
+    const runId = crypto.randomUUID()
+    const stuck = run(
+      {
+        code: `await tools.call("mcp__notes__search", { query: "${STUCK_QUERY}" })\nreturn "finished"`,
+      },
+      runId,
+    )
+
+    while (!seenToolCalls.some((input) => input['query'] === STUCK_QUERY)) {
+      await Bun.sleep(50)
+    }
+
+    expect(await post('/stop', JSON.stringify({ runId }))).toEqual({ stopped: true })
+
+    expect((await stuck).text).toMatch(/^run failed: [^]*the run was interrupted/u)
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  "long output arrives whole, and a file past Read's size cap is read in pages",
+  async () => {
+    const reply = await run({
+      code: `const shell = await tools.call("Bash", { command: "long" })\nconst big = await tools.call("Read", { file_path: "${BIG_PATH}" })\nreturn { stdout: (shell.result as { stdout: string }).stdout, big: big.result, isError: big.isError }`,
+    })
+
+    const { stdout, big, isError } = z
+      .object({
+        stdout: z.string(),
+        big: z.object({ file: z.object({ content: z.string(), numLines: z.number() }) }),
+        isError: z.boolean(),
+      })
+      .parse(JSON.parse(reply.text))
+
+    expect(stdout).toBe(WHOLE_OUTPUT)
+
+    expect([isError, big.file.numLines, big.file.content]).toEqual([
+      false,
+      BIG_LINES.length,
+      BIG_LINES.join('\n'),
+    ])
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test(
+  'a run the server never had is reported lost',
+  async () => {
+    const reply = z
+      .object({ text: z.string(), images: z.array(z.json()) })
+      .parse(await post('/wait', JSON.stringify({ runId: 'gone' })))
+
+    expect(reply.text).toMatch(/^run failed: no run gone here/u)
+
+    expect(reply.images).toEqual([])
   },
   TEST_TIMEOUT_MS,
 )

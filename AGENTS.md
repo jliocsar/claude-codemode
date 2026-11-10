@@ -11,11 +11,16 @@ reaches tools only through `tools.call(name, input)`, `tools.search(query)`,
 ```text
 .claude-plugin/plugin.json   # manifest
 .claude-plugin/types/        # written by Claude Code when it loads the plugin; gitignored, never edit
-hooks/register.ts            # plugin side: registers `run`, hides relayed tools, relays tool calls
+hooks/register.ts            # plugin side: registers `run`, hides relayed tools, runs and backgrounds runs
 hooks/run-tool.ts            # `run`'s name, schema, description, the tools it relays; its result
+hooks/server-process.ts      # spawns the server, and again whenever it exits
+hooks/server-connection.ts   # asks the server; checks, kills and replaces one that stopped answering
+hooks/tool-relay.ts          # runs the programs' tool calls and posts the answers back
 hooks/codemode.test.ts       # `claude plugin test .`
-codemode/server.ts           # Bun child: one VM, evaluates programs, socket server, zoom
-codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`
+codemode/server.ts           # Bun child: socket server, runs by id, stopping them
+codemode/program.ts          # one program: type check, evaluate, its reply; VM failures spotted
+codemode/vm.ts               # the VM, made again when it fails; host functions; tool call tickets
+codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output
 codemode/image.ts            # returned pictures out of the value, PDF page pictures, zoom
 codemode/png.ts              # Bun.Image's RGBA PNGs to pixels and back, for the crop
 codemode/catalog.ts          # tool input types from the generated d.ts, type-check prelude, search
@@ -32,14 +37,15 @@ package.json                 # dev tooling only: oxlint, oxfmt, begone-slop, typ
   WebAssembly. It can import other plugin files and types from `'claude-code'`, nothing else. Talk
   to the outside through `$` only. The API's types are in
   `.claude-plugin/types/claude-code/index.d.ts`; grep it for the event or noun at hand.
-- `codemode/` is Bun ≥ 1.4 (for `Bun.Image`), spawned by the plugin as `bun server.ts` with
+- `codemode/` is Bun ≥ 1.4 (for `Bun.Image`), spawned by the plugin as `bun <absolute path>/server.ts` with
   `$.process.spawn` for the session's life. Use Bun's own APIs (`Bun.serve`, `Bun.file`,
   `Bun.Image`, `bun:test`) before `node:*` ones; zod stays because secure-exec takes only zod.
 
-They talk in two directions: the server writes `CODEMODE_READY <socket>` and
-`CODEMODE_TOOL_CALL {callId, input}` lines on stdout; the plugin `POST`s `/run`, `/wait` and `/answer` to
-the server's Unix socket with `$.http.fetch({ socketPath })`; every reply is JSON, a run's
-`{ text, images }`. Keep stdout for the protocol alone.
+They talk in two directions: the server writes `CODEMODE_READY {socketPath, pid}` and
+`CODEMODE_TOOL_CALL {callId, input, discardResult?}` lines on stdout; the plugin `POST`s `/run`,
+`/wait`, `/stop` and `/answer` (and `GET`s `/health`) on the server's Unix socket with
+`$.http.fetch({ socketPath })`; every reply is JSON, a run's `{ text, images }`. Keep stdout for the
+protocol alone.
 
 ## Decisions that hold
 
@@ -54,7 +60,33 @@ the server's Unix socket with `$.http.fetch({ socketPath })`; every reply is JSO
 - `run` only stays in the prompt list because `$.ui.invalidate('tool.describe')` follows its
   registration.
 - Strings with quotes, backticks or backslashes travel in `inputs`, never inlined into `code`.
-- One VM per session; runs are serialized. Never use secure-exec's one-shot `evaluate` (~9 s).
+- One VM per server, and runs go side by side in it, each with its own stdout (measured). Never use
+  secure-exec's one-shot `evaluate` (~9 s). The plugin names each run (`runId`), so a `/run` sent
+  again after a failed fetch waits on the same program.
+- Secure Exec fails any one host call past 30 s (`timed out waiting for sidecar response after
+  30s`), whatever `limits.hostFunctions` or `limits.jsRuntime.syncRpcWaitTimeoutMs` say
+  (measured). So `codemode.call` and `codemode.zoom` answer at once with a ticket, and the guest
+  waits on it with `codemode.wait` in `HOST_WAIT_MS` (20 s) rounds.
+- Nothing times out: every VM limit is `NO_LIMIT_MS` (a day). A run still going after
+  `CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` (120 s) moves to the background: `run` answers with its id,
+  the plugin keeps asking `/wait`, and hands the model the reply with `$.prompt.submit`. Pictures
+  cannot travel in a plugin's prompt; the message counts them. `tools.stopRun(id)` stops one.
+- An interrupt `POST`s `/stop`: the run's waiting tool calls fail first, then the evaluate is
+  aborted. An abort during a host call logs a sidecar panic (`RefCell already mutably borrowed`),
+  yet the run still resolves `cancelled` and the VM keeps working (measured).
+- Recovery, from what failed in past sessions: a call that throws, a check that cannot run, or a
+  `SidecarProcessExited` failure replaces the VM (`shutdown()`, then `createVm`); a VM that cannot
+  be made again exits the server. The plugin starts an exited server again (up to five times in
+  five minutes). A failed fetch checks `/health`; a server that does not answer is sent SIGTERM,
+  SIGKILL 3 s later, and the request goes to the next one, except a `/run`: a program that killed
+  its own server ran again on the next and killed it too (measured), so that run reads as failed.
+  A run lost with its server reads `no run <id> here`.
+- The server is spawned by its absolute path: a `pkill -f "bun server.ts"` once killed every
+  session's server at once.
+- Long output arrives whole: the engine cuts a long result to a `<persisted-output>` preview (Bash's
+  `stdout` at 30,000 characters) and saves it under `<config>/projects/*/tool-results/`; the relay
+  reads that file back, from no other directory. Read past its 256 KB cap is read again in pages
+  with `offset` and `limit`.
 - Host function schemas reject `z.unknown()`; use `z.looseObject({})`.
 - Pictures reach the model only when the program returns them. The server swaps each one's
   `base64` for `[image N]` and keeps the rest of its record; `run` answers with a text block and
@@ -62,15 +94,16 @@ the server's Unix socket with `$.http.fetch({ socketPath })`; every reply is JSO
   MCP-style `{ content }` result, and `{ data, mimeType }` image blocks fail at the API.
 - Read with `pages` hands a plugin the PDF's `outputDir`, never the page pictures: the server loads
   `page-N.*` from there after the relayed Read.
-- `tools.zoom` relays Read first as its permission check and takes absolute paths only, so both
-  name the same file. `Bun.Image` has no crop: `png.ts` slices its RGBA PNG output, then
+- `tools.zoom` relays Read first as its permission check (`discardResult`, so the picture's bytes
+  don't travel back) and takes absolute paths only, so both name the same file. `Bun.Image` has no crop: `png.ts` slices its RGBA PNG output, then
   `Bun.Image` enlarges each pixel to a block up to Read's 2000 px long edge.
-- No `idleTimeout` on `Bun.serve`: a Unix socket has none, and a run can last 30 minutes.
+- No `idleTimeout` on `Bun.serve`: a Unix socket has none, and a run never times out.
 - `$.http.fetch` aborts any request after 30 s, undocumented. `/run` and `/wait` answer within
   `REPLY_WAIT_MS` (20 s) with the reply or `{ pendingRunId }`; the plugin polls `/wait` until done.
   A single fetch that outlived 30 s left the program running unseen, and the model retried it.
 - Long commands are the session's own background tasks: relayed Bash takes `run_in_background`
-  and the completion notice reaches the model. Never background anything inside the server.
+  and the completion notice reaches the model. The server backgrounds nothing itself: a run in the
+  background is only the plugin no longer waiting on it.
 
 ## Commands
 
