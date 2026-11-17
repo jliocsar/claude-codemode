@@ -1,15 +1,18 @@
 // One program, from type check to reply: what the model reads of it, and the
 // VM made again when it was the VM, not the program, that failed.
 
-import type { Vm } from 'secure-exec'
+import type { Context } from 'secure-exec'
 import { z } from 'zod'
 import { buildTypeCheckPrelude, type CatalogEntry, currentToolInputTypes } from './catalog.ts'
+import { stripTypes, typeErrors, withLastExpressionReturned } from './checker.ts'
 import { type JsonValue, type ModelImage, takeOutImages } from './image.ts'
 import {
   guestPrelude,
   NO_LIMIT_MS,
+  releaseContext,
   replaceVm,
   type RunLookup,
+  takeContext,
   type VmGeneration,
   vmInUse,
 } from './vm.ts'
@@ -22,6 +25,8 @@ export type Program = {
   code: string
   inputs: Record<string, JsonValue>
   catalog: readonly CatalogEntry[]
+  // The session's directory: relative paths in `read`, `write`, `edit` and `$`'s `.cwd` start here.
+  cwd: string
   signal: AbortSignal
 }
 
@@ -30,6 +35,8 @@ type RunResponse =
   | { ok: false; feedback: string; stdout: string }
 
 type SucceededRun = Extract<RunResponse, { ok: true }>
+
+type Evaluation = Awaited<ReturnType<Context['evaluate']>>
 
 // What a failed VM looks like from outside, beside a call that throws.
 const VM_FAILURE =
@@ -42,13 +49,18 @@ const jsonValueSchema = z.json()
 
 // What the model reads: the returned value alone (a string as is), its
 // pictures as `[image N]` with the images after, or why the run failed; then
-// any console output.
+// any console output. With no value, the console output alone.
 export async function runProgram(program: Program, runs: RunLookup): Promise<RunReply> {
   const response = await respond(program, runs)
+  const stdout = response.stdout.trimEnd()
+
+  if (response.ok && response.value === null) {
+    return { text: stdout === '' ? '(no value)' : stdout, images: [] }
+  }
+
   const { text, images } = response.ok
     ? returnedValueReply(response)
     : { text: `run failed: ${response.feedback}`, images: [] }
-  const stdout = response.stdout.trimEnd()
 
   return { text: stdout === '' ? text : `${text}\n\nstdout:\n${stdout}`, images }
 }
@@ -63,46 +75,22 @@ function returnedValueReply(response: SucceededRun): RunReply {
   }
 }
 
-// Why the VM could not check or run the program, plainly when the disk is full.
-function vmFailureFeedback(stage: string, cause: string) {
+// Why the VM could not run the program, plainly when the disk is full.
+function vmFailureFeedback(cause: string) {
   return DISK_FULL.test(cause)
-    ? `the disk is full, so the VM could not ${stage}: ${cause}`
-    : `the VM failed to ${stage} and was restarted: ${cause}`
-}
-
-async function typeErrors(vm: Vm, { code, catalog, signal }: Program) {
-  const typeCheckPrelude = buildTypeCheckPrelude(catalog, await currentToolInputTypes())
-  const checked = await vm.typescript.check(`${typeCheckPrelude}${code}\n}\nexport {}\n`, {
-    signal,
-  })
-
-  if (checked.outcome !== 'succeeded') {
-    const output = `${checked.stderr ?? ''}${checked.stdout ?? ''}`.trim()
-
-    throw new Error(output === '' ? checked.error.message : `${checked.error.message}: ${output}`)
-  }
-
-  const typeCheckPreludeLineCount = typeCheckPrelude.split('\n').length - 1
-
-  return checked.diagnostics
-    .filter((diagnostic) => diagnostic.category === 'error')
-    .map(
-      (diagnostic) =>
-        `line ${(diagnostic.line ?? 0) - typeCheckPreludeLineCount}: TS${diagnostic.code} ${diagnostic.message}`,
-    )
+    ? `the disk is full, so the VM could not run the program: ${cause}`
+    : `the VM failed to run the program and was restarted: ${cause}. ${MAY_HAVE_RUN}`
 }
 
 async function respond(program: Program, runs: RunLookup): Promise<RunResponse> {
-  const vmUsed = await vmInUse(runs)
+  const code = withLastExpressionReturned(program.code)
   let errors: string[]
 
   try {
-    errors = await typeErrors(vmUsed.vm, program)
+    const prelude = buildTypeCheckPrelude(program.catalog, await currentToolInputTypes())
+    errors = typeErrors(prelude, code)
   } catch (cause) {
-    const message = String(cause)
-    await replaceVm(vmUsed, runs)
-
-    return { ok: false, feedback: vmFailureFeedback('type-check the program', message), stdout: '' }
+    return { ok: false, feedback: `the type check failed: ${String(cause)}`, stdout: '' }
   }
 
   if (errors.length > 0) {
@@ -113,36 +101,47 @@ async function respond(program: Program, runs: RunLookup): Promise<RunResponse> 
     }
   }
 
-  return evaluate(vmUsed, program, runs)
+  return evaluate(await vmInUse(runs), { ...program, code }, runs)
+}
+
+// The program's value as JSON, the way the model reads it: Secure Exec fails
+// an `undefined` value (measured), so no value reads as `null`, and
+// functions drop out as JSON.stringify drops them.
+function guestSource({ runId, code }: Program) {
+  return stripTypes(
+    `(async () => {\n${guestPrelude(runId)}\n${code}\n})().then((value) => JSON.parse(JSON.stringify(value) ?? 'null'))`,
+  )
 }
 
 async function evaluate(
   vmUsed: VmGeneration,
-  { runId, code, inputs, signal }: Program,
+  program: Program,
   runs: RunLookup,
 ): Promise<RunResponse> {
-  let ran: Awaited<ReturnType<Vm['typescript']['evaluate']>>
+  const { inputs, signal } = program
+  let context: Context | undefined
+  let ran: Evaluation
 
   try {
-    ran = await vmUsed.vm.typescript.evaluate(
-      `(async () => {\n${guestPrelude(runId)}\n${code}\n})()`,
-      { inputs, timeoutMs: NO_LIMIT_MS, signal, output: { capture: 'all' } },
-    )
+    context = await takeContext(vmUsed)
+    ran = await context.evaluate(guestSource(program), {
+      inputs,
+      timeoutMs: NO_LIMIT_MS,
+      signal,
+      output: { capture: 'all' },
+    })
   } catch (cause) {
+    await context?.dispose().catch(() => undefined)
     await replaceVm(vmUsed, runs)
 
-    return {
-      ok: false,
-      feedback: `${vmFailureFeedback('run the program', String(cause))}. ${MAY_HAVE_RUN}`,
-      stdout: '',
-    }
+    return { ok: false, feedback: vmFailureFeedback(String(cause)), stdout: '' }
   }
 
+  await releaseContext(vmUsed, context, ran.outcome !== 'cancelled')
   const stdout = ran.stdout ?? ''
 
   if (ran.outcome === 'succeeded') {
-    // As JSON, the way the model reads it: `undefined` and functions drop out.
-    const value = jsonValueSchema.parse(JSON.parse(JSON.stringify(ran.value ?? null)))
+    const value = jsonValueSchema.parse(ran.value ?? null)
 
     return { ok: true, value, stdout }
   }
@@ -160,9 +159,5 @@ async function evaluate(
 
   await replaceVm(vmUsed, runs)
 
-  return {
-    ok: false,
-    feedback: `${vmFailureFeedback('run the program', failure)}. ${MAY_HAVE_RUN}`,
-    stdout,
-  }
+  return { ok: false, feedback: vmFailureFeedback(failure), stdout }
 }

@@ -1,29 +1,26 @@
-import { afterAll, expect, test } from 'bun:test'
+import { expect, test } from 'bun:test'
 import { z } from 'zod'
 import { decodeRgbaPng } from './png.ts'
 import {
   BIG_LINES,
   BIG_PATH,
   PDF_PATH,
-  post,
   patternPath,
   patternPixel,
-  run,
-  seenToolCalls,
-  server,
   SHOT_BASE64,
   SHOT_PATH,
   SLOW_QUERY,
   STUCK_QUERY,
+  WHOLE_OUTPUT,
+} from './spec-answers.ts'
+import {
+  post,
+  run,
+  seenToolCalls,
   TEST_TIMEOUT_MS,
   TRICKY_STRING,
-  WHOLE_OUTPUT,
   zoomedSummarySchema,
 } from './spec-harness.ts'
-
-afterAll(() => {
-  server.kill('SIGTERM')
-})
 
 test(
   'edit strings from inputs reach the tool byte for byte',

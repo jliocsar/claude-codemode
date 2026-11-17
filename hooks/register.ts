@@ -34,14 +34,29 @@ import { customConversationTools } from './tool-relay'
 // command does; CLAUDE_CODEMODE_BACKGROUND_AFTER_MS sets another.
 const BACKGROUND_AFTER_MS = 120_000
 
+// Claude Code's own Code Mode runs code through this tool. With it on, two
+// code tools would only split the model's attention, so codemode stands down.
+const BUILT_IN_CODE_TOOL = 'REPL'
+
 export const register: Register = (on) => {
   const server: ServerState = { current: pendingConnection() }
+  // False once the session turns out to have Claude Code's own Code Mode.
+  let active = true
   // Runs moved to the background, followed from `session.start`: its engine
   // lives for the session, beyond the `run` call that moved them.
   const backgroundRuns = runQueue()
 
   on('session.start', async ($, event, next) => {
     const started = await next(event)
+
+    if ((await $.tool.list()).some(({ name }) => name === BUILT_IN_CODE_TOOL)) {
+      active = false
+      $.ui.log("codemode: Claude Code's own Code Mode is on, so codemode stays off this session")
+      $.ui.invalidate('tool.describe')
+
+      return started
+    }
+
     await $.tool.register({
       name: RUN_TOOL_NAME,
       description: RUN_TOOL_DESCRIPTION,
@@ -59,9 +74,11 @@ export const register: Register = (on) => {
       return { deny: 'run needs `code`: the body of an async TypeScript function' }
     }
 
-    const [catalog, backgroundAfterMs] = await Promise.all([
+    const [catalog, backgroundAfterMs, maxRunMs, cwd] = await Promise.all([
       relayedToolCatalog($, await customConversationTools($)),
-      readBackgroundAfterMs($),
+      positiveMs($.env.get('CLAUDE_CODEMODE_BACKGROUND_AFTER_MS')),
+      positiveMs($.env.get('CLAUDE_CODEMODE_MAX_RUN_MS')),
+      $.session.cwd(),
     ])
     const runId = newRunId()
     const startedAt = Date.now()
@@ -75,6 +92,8 @@ export const register: Register = (on) => {
         code: event.code,
         inputs: event.inputs ?? {},
         catalog,
+        cwd,
+        maxRunMs,
       })
       let reply = await ask('/run', runJson)
 
@@ -84,7 +103,7 @@ export const register: Register = (on) => {
       while (reply !== 'interrupted' && reply.pendingRunId !== undefined) {
         const elapsedMs = Date.now() - startedAt
 
-        if (elapsedMs >= backgroundAfterMs) {
+        if (elapsedMs >= (backgroundAfterMs ?? BACKGROUND_AFTER_MS)) {
           backgroundRuns.push(runId)
 
           return { result: backgroundedRunText(runId, elapsedMs) }
@@ -109,6 +128,10 @@ export const register: Register = (on) => {
   on('tool.describe', async ($, event, next) => {
     const [described, custom] = await Promise.all([next(event), customConversationTools($)])
 
+    if (!active) {
+      return described
+    }
+
     if (event.tool === RUN_TOOL_FULL_NAME) {
       return { ...described, isDeferred: false }
     }
@@ -119,19 +142,21 @@ export const register: Register = (on) => {
   on('prompt.attachment', { type: 'deferred_tools_delta' }, async ($, event, next) => {
     const [attached, custom] = await Promise.all([next(event), customConversationTools($)])
 
-    return attached.text === null
+    return !active || attached.text === null
       ? attached
       : { ...attached, text: withoutRelayedToolNames(attached.text, custom) }
   })
 }
 
-async function readBackgroundAfterMs($: EngineInterface) {
+// A positive number of milliseconds from an environment variable, or undefined.
+// `$.env.get` takes only a literal name, so the caller reads it.
+async function positiveMs(read: Promise<string | undefined>) {
   try {
-    const configured = Number(await $.env.get('CLAUDE_CODEMODE_BACKGROUND_AFTER_MS'))
+    const configured = Number(await read)
 
-    return Number.isFinite(configured) && configured > 0 ? configured : BACKGROUND_AFTER_MS
+    return Number.isFinite(configured) && configured > 0 ? configured : undefined
   } catch {
-    return BACKGROUND_AFTER_MS
+    return undefined
   }
 }
 
@@ -162,10 +187,12 @@ async function followBackgroundRun($: EngineInterface, server: ServerState, runI
   let text: string
 
   try {
-    let reply = await askServer($, server, '/wait', JSON.stringify({ runId }))
+    // Pictures cannot travel in a prompt: the server saves them as files.
+    const waitJson = JSON.stringify({ runId, picturesToFiles: true })
+    let reply = await askServer($, server, '/wait', waitJson)
 
     while (reply.pendingRunId !== undefined) {
-      reply = await askServer($, server, '/wait', JSON.stringify({ runId }))
+      reply = await askServer($, server, '/wait', waitJson)
     }
 
     text = finishedBackgroundRunText(runId, reply)

@@ -48,43 +48,42 @@ export const RUN_INPUT_SCHEMA = {
   additionalProperties: false,
 }
 
-export const RUN_TOOL_DESCRIPTION = `Run a TypeScript program against Claude Code's tools in an isolated VM. This is how you read, write and edit files, run shell commands, fetch and search the web, and call MCP servers: those tools are reachable only from here, unless you have them directly.
+export const RUN_TOOL_DESCRIPTION = `Run TypeScript in an isolated VM: how you use Claude Code's tools (files, shell, web, MCP). Loop, batch and filter in one run; return only what you need.
 
-Loop, branch, batch and filter in one call, and return only what matters. \`code\` is the body of an async function: await the calls and \`return\` a JSON value. You read the value alone (a string as is), then any console.log output; a failed run reads \`run failed: <why>\`.
+\`code\` is an async function body. Its last expression (or \`return\`) is the result, a string as is, else JSON, then any console output. It's type-checked first: a type error runs nothing.
 
 \`\`\`ts
+/** Bun Shell's \`$\` over Bash: \`\${x}\` is quoted; await gives {stdout, stderr, exitCode} (stderr merged into stdout), throwing on a non-zero exit unless .nothrow(). Also .text() .json() .lines() .cwd(dir) */
+declare const $: Shell
+/** Relative paths start at the session's directory. */
+declare function read(path: string, options?: { offset?: number; limit?: number }): Promise<string>
+declare function write(path: string, content: string): Promise<void>
+declare function edit(path: string, oldText: string, newText: string, options?: { all?: boolean }): Promise<void>
+/** Async get/set/delete of JSON values kept across runs. */
+declare const keep: AsyncMap<string, any>
 declare const tools: {
-  /**
-   * Run one tool by name, e.g. "Read", "Edit", "Bash", "WebFetch", "mcp__<server>__<tool>".
-   * \`result\`: the tool's own record (Read's file, Bash's streams), else \`text\` parsed when JSON, else \`text\`.
-   * Long output comes back whole in both, and Read pages through a file past its size cap.
-   */
+  /** Any tool, e.g. "WebFetch", "mcp__<server>__<tool>". result: its own record (Read's file), else its text, parsed when JSON. */
   call(name: string, input: object): Promise<{ text: string; isError: boolean; result: unknown }>
-  /** Find tools by words in their name or description; each comes with its input type. "" lists them all. */
+  /** Tools matching the words, with input types; "" lists all. */
   search(query: string): Promise<{ name: string; description: string; input: string }[]>
-  /**
-   * Part of an image file at its own pixels, each one enlarged to a block, for detail Read scales away.
-   * \`region\` is in the file's pixels: Read's \`result.file.dimensions\` maps what you saw to them.
-   */
-  zoom(filePath: string, region: { x: number; y: number; width: number; height: number }): Promise<object>
-  /** Stops a run that moved to the background, by its id. */
-  stopRun(runId: string): Promise<boolean>
+  /** An image region at its own pixels, enlarged; region in the file's pixels. */
+  zoom(path: string, region: { x: number; y: number; width: number; height: number }): Promise<object>
+  runs(): Promise<{ id: string; seconds: number; code: string }[]>
+  stopRun(id: string): Promise<boolean>
 }
 declare const inputs: any
 \`\`\`
 
-Return a picture to see it: Read's \`result\` for an image file or PDF pages, or what \`tools.zoom\` gives, anywhere in the value. Its \`base64\` reads as \`[image N]\`, the rest of its record as is, and the images come after the text. Pictures you don't return never reach you.
-
-Search before calling a tool whose input you don't know. Common ones: Read { file_path, offset?, limit? }, Write { file_path, content }, Edit { file_path, old_string, new_string, replace_all? }, Bash { command, timeout?, run_in_background? }.
-A run never times out, and runs can go side by side. One still going after 2 minutes moves to the background: you get its id at once and its result later as a message, so carry on meanwhile and don't poll for it. For one long shell command, Bash's run_in_background is lighter still.
-Put file contents, edit strings and any text with quotes, backticks or backslashes in \`inputs\` and read them as \`inputs.name\`. Never write them inline in \`code\`.
-The VM has no network and no real filesystem: \`tools\` is the only way out, and every call goes through the usual permissions.
-The code is type-checked against each tool's real input type first. A type error comes back without anything running.`
+Pictures reach you only when returned: Read's \`result\` for an image or PDF, or zoom's.
+Search for a tool before calling one whose input you don't know.
+A run past 2 min moves to the background; its result arrives later as a message, so don't poll.
+Text with quotes, backticks or backslashes goes in \`inputs\`, never inline in \`code\`.
+No network or real filesystem: these globals are the only way out, under the usual permissions.`
 
 export function backgroundedRunText(runId: string, elapsedMs: number) {
   const seconds = Math.round(elapsedMs / 1000)
 
-  return `Still running after ${seconds} s, so run ${runId} moved to the background. Its result arrives as a message when it ends: carry on, and don't poll or sleep for it. \`tools.stopRun("${runId}")\` stops it.`
+  return `Still running after ${seconds} s: run ${runId} moved to the background, and its result arrives as a message. Don't poll it. \`tools.stopRun("${runId}")\` stops it.`
 }
 
 // The prompt that hands the model a background run's reply. Pictures cannot

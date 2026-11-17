@@ -1,28 +1,30 @@
 // The spec's stand-in for the plugin: spawns the real server, answers its tool
-// calls with canned results, and posts runs to it. Not a spec itself, so
-// `bun test` runs it only through server.spec.ts.
+// calls with canned results (spec-answers.ts), and posts runs to it. Not a
+// spec itself, so `bun test` runs it only through the specs.
 
-import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
-import type { JsonValue } from './image.ts'
-import { encodeRgbaPng } from './png.ts'
+import {
+  cannedAnswer,
+  fixtureDirectory,
+  SLOW_QUERY,
+  STUCK_QUERY,
+  type ToolCallInput,
+  toolCallInputSchema,
+} from './spec-answers.ts'
+
+export const TEST_TIMEOUT_MS = 60_000
+export const TRICKY_STRING = 'a`b${c}\\d "e" \'f\'\nnext line'
+
+export const zoomedSummarySchema = z.object({
+  region: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+  size: z.object({ displayWidth: z.number(), displayHeight: z.number() }),
+})
 
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 const SLOW_ANSWER_MS = 500
-
-export const TEST_TIMEOUT_MS = 60_000
-export const TRICKY_STRING = 'a`b${c}\\d "e" \'f\'\nnext line'
-export const SHOT_PATH = '/shot.png'
-export const SHOT_BASE64 = 'c2hvdA=='
-export const PDF_PATH = '/doc.pdf'
-export const BIG_PATH = '/big.txt'
-export const BIG_LINES = Array.from({ length: 4500 }, (_line, index) => `line ${index + 1}`)
-export const SLOW_QUERY = 'slow'
-export const STUCK_QUERY = 'stuck'
-export const WHOLE_OUTPUT = 'the whole output, past the preview'
 
 const CATALOG = [
   { name: 'Read', description: 'Reads a file from the local filesystem.' },
@@ -31,18 +33,8 @@ const CATALOG = [
   { name: 'mcp__notes__search', description: 'Search notes by keyword.' },
 ]
 
-// A 4×2 picture, each pixel its own color (patternPixel).
-const PATTERN = { width: 4, height: 2 }
-
 const readyLineSchema = z.object({ socketPath: z.string(), pid: z.number() })
-const readPageSchema = z.looseObject({
-  offset: z.number().optional(),
-  limit: z.number().optional(),
-})
-const toolCallLineSchema = z.object({
-  callId: z.string(),
-  input: z.looseObject({ tool: z.string() }),
-})
+const toolCallLineSchema = z.object({ callId: z.string(), input: toolCallInputSchema })
 const runReplySchema = z.object({
   text: z.string(),
   images: z.array(z.object({ mediaType: z.string(), base64: z.string() })),
@@ -51,45 +43,20 @@ const serverReplySchema = z.union([
   runReplySchema.extend({ pendingRunId: z.undefined().optional() }),
   z.object({ pendingRunId: z.string() }),
 ])
-export const zoomedSummarySchema = z.object({
-  region: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
-  size: z.object({ displayWidth: z.number(), displayHeight: z.number() }),
-})
 
-type ToolCallInput = z.infer<typeof toolCallLineSchema>['input']
-
-// The pattern, and the folder where Read leaves a PDF's pages as pictures.
-const fixtureDirectory = await mkdtemp(join(tmpdir(), 'codemode-spec-'))
-export const patternPath = join(fixtureDirectory, 'pattern.png')
-await Bun.write(patternPath, encodeRgbaPng({ ...PATTERN, pixels: patternPixels() }))
-await Bun.write(join(fixtureDirectory, 'page-2.png'), 'page two')
-await Bun.write(join(fixtureDirectory, 'page-1.png'), 'page one')
-
-// Where the engine saves an output too long to show: under its config's projects.
-const toolResultsDirectory = join(
-  fixtureDirectory,
-  'projects',
-  'project',
-  'session',
-  'tool-results',
-)
-const persistedOutputPath = join(toolResultsDirectory, 'output.txt')
-await Bun.write(persistedOutputPath, WHOLE_OUTPUT)
-
-const SHOT_RECORD = { type: 'image', file: { base64: SHOT_BASE64, type: 'image/png' } }
-
-const READ_RESULTS = new Map<string, JsonValue>([
-  [SHOT_PATH, SHOT_RECORD],
-  [patternPath, SHOT_RECORD],
-  [PDF_PATH, { type: 'parts', file: { outputDir: fixtureDirectory, count: 2 }, firstPage: 1 }],
-])
+// A server that is gone, as one killed with SIGKILL leaves it: its scratch
+// directory stays, for the next server to sweep.
+const goneServer = Bun.spawn(['true'])
+await goneServer.exited
+export const goneScratchDirectory = join(tmpdir(), 'claude-codemode', String(goneServer.pid))
+await Bun.write(join(goneScratchDirectory, 'agentos-left-behind'), '')
 
 export const server = Bun.spawn(['bun', 'server.ts'], {
   cwd: import.meta.dir,
   stdout: 'pipe',
   stderr: 'ignore',
-  // Short, so every run (a type check alone is ~1.5 s) goes through `/wait`.
-  // Short host waits too, so a slow tool call takes several rounds.
+  // Short, so a run with a slow tool call goes through `/wait`, and that call
+  // takes several host wait rounds.
   env: {
     ...Bun.env,
     CODEMODE_REPLY_WAIT_MS: '100',
@@ -100,17 +67,10 @@ export const server = Bun.spawn(['bun', 'server.ts'], {
 export const seenToolCalls: ToolCallInput[] = []
 const serverSocketPath = waitForServerSocketPath()
 
-export function patternPixel(column: number, row: number) {
-  return [column * 60, row * 200, 255 - column * 60, 255]
-}
-
-function patternPixels() {
-  return new Uint8Array(
-    Array.from({ length: PATTERN.width * PATTERN.height }, (_pixel, index) =>
-      patternPixel(index % PATTERN.width, Math.floor(index / PATTERN.width)),
-    ).flat(),
-  )
-}
+// Every spec file shares this one server; it stops when the test process does.
+process.once('exit', () => {
+  server.kill('SIGTERM')
+})
 
 export async function post(path: string, bodyJson: string) {
   const response = await fetch(`http://codemode${path}`, {
@@ -124,7 +84,16 @@ export async function post(path: string, bodyJson: string) {
 
 // What the model reads: the text, and the images after it.
 export async function run(
-  body: { code: string; inputs?: Record<string, string> },
+  {
+    picturesToFiles,
+    ...body
+  }: {
+    code: string
+    inputs?: Record<string, string>
+    cwd?: string
+    maxRunMs?: number
+    picturesToFiles?: boolean
+  },
   runId = crypto.randomUUID(),
 ) {
   let reply = serverReplySchema.parse(
@@ -133,88 +102,11 @@ export async function run(
 
   while (reply.pendingRunId !== undefined) {
     reply = serverReplySchema.parse(
-      await post('/wait', JSON.stringify({ runId: reply.pendingRunId })),
+      await post('/wait', JSON.stringify({ runId: reply.pendingRunId, picturesToFiles })),
     )
   }
 
   return reply
-}
-
-// What the engine answers: Bash is denied, the MCP tool's `result` is its text
-// again, Read hands back READ_RESULTS and errors elsewhere as the engine does
-// (`result` is `text` behind `Error: `); the rest echo their input as a record.
-function cannedAnswer(callId: string, { tool, ...args }: ToolCallInput) {
-  if (tool === 'Bash' && args['command'] === 'long') {
-    const result = { stdout: 'preview', stderr: '', persistedOutputPath }
-
-    return { callId, outcome: 'answered', text: 'preview', isError: false, result }
-  }
-
-  if (tool === 'Bash') {
-    return { callId, outcome: 'denied', reason: 'not allowed in this test' }
-  }
-
-  if (tool === 'Read' && args['file_path'] === BIG_PATH) {
-    return bigFileAnswer(callId, readPageSchema.parse(args))
-  }
-
-  if (tool === 'mcp__notes__search') {
-    const notesText = JSON.stringify({ hits: [args['query']] })
-
-    return { callId, outcome: 'answered', text: notesText, isError: false, result: notesText }
-  }
-
-  const readResult = tool === 'Read' ? READ_RESULTS.get(String(args['file_path'])) : undefined
-
-  if (readResult !== undefined) {
-    return { callId, outcome: 'answered', text: 'read', isError: false, result: readResult }
-  }
-
-  if (tool === 'Read') {
-    return {
-      callId,
-      outcome: 'answered',
-      text: 'File does not exist.',
-      isError: true,
-      result: 'Error: File does not exist.',
-    }
-  }
-
-  return {
-    callId,
-    outcome: 'answered',
-    text: `ok ${tool}`,
-    isError: false,
-    result: { echoed: args },
-  }
-}
-
-// Read past its size cap: an error for the whole file, a page of it with
-// offset and limit, as the engine does.
-function bigFileAnswer(callId: string, { offset, limit }: z.infer<typeof readPageSchema>) {
-  if (offset === undefined || limit === undefined) {
-    const text =
-      'File content (300KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file.'
-
-    return { callId, outcome: 'answered', text, isError: true, result: `Error: ${text}` }
-  }
-
-  const lines = BIG_LINES.slice(offset - 1, offset - 1 + limit)
-  const file = {
-    filePath: BIG_PATH,
-    content: lines.join('\n'),
-    numLines: lines.length,
-    startLine: offset,
-    totalLines: BIG_LINES.length,
-  }
-
-  return {
-    callId,
-    outcome: 'answered',
-    text: 'page',
-    isError: false,
-    result: { type: 'text', file },
-  }
 }
 
 // Stands in for the plugin: answers each tool call with a canned result, a

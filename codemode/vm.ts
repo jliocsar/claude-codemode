@@ -1,22 +1,48 @@
 // The Secure Exec VM the programs run in, side by side: made once, made again
 // when it fails, and the host functions a program reaches `tools` through.
 //
+// Each run takes a context of its own from a pool and gives it back after: a
+// warm context evaluates in ~9 ms against ~95 ms for a fresh call (measured).
+// They are not reset between runs, since a reset context is cold again.
+//
 // Secure Exec fails any one host call past 30 s, whatever its limits say
 // (measured), so a tool call hands the program a ticket, and the program waits
 // on it in rounds shorter than that.
 
-import { createVm, shutdown, type Vm } from 'secure-exec'
+import { type Context, createVm, shutdown, type Vm } from 'secure-exec'
 import { z } from 'zod'
 import { type CatalogEntry, currentToolInputTypes, searchCatalog } from './catalog.ts'
+import { guestApi } from './guest.ts'
+import { resolve } from 'node:path'
 import { type JsonValue, type ZoomRegion, zoomRegionSchema } from './image.ts'
 import { callTool, type ToolInput, toolInputSchema, zoomFile } from './relay.ts'
+import {
+  type EditRequest,
+  editFile,
+  editRequestSchema,
+  type ReadRequest,
+  readRequestSchema,
+  readText,
+  runShell,
+  type ShellRequest,
+  shellRequestSchema,
+  type WriteRequest,
+  writeFile,
+  writeRequestSchema,
+} from './shorthands.ts'
 
-export type VmGeneration = { vm: Vm; generation: number }
+export type VmGeneration = { vm: Vm; generation: number; idleContexts: Context[] }
+
+// A run still going, as `tools.runs()` lists it.
+export type RunningRun = { id: string; seconds: number; code: string }
 
 // What the host functions need of the server's runs.
 export type RunLookup = {
   catalogOf: (runId: string) => readonly CatalogEntry[]
+  // The session's directory, where the run's relative paths start.
+  cwdOf: (runId: string) => string
   stopRun: (runId: string, reason: string) => boolean
+  running: () => RunningRun[]
 }
 
 // A started tool call or zoom, settled with its value or why it failed.
@@ -26,25 +52,21 @@ type Ticket = { runId: string; settled: Promise<Settled> }
 
 const HOST_WAIT_MS = Number(Bun.env['CODEMODE_HOST_WAIT_MS'] ?? 20_000)
 const VM_DISPOSE_WAIT_MS = 5_000
+// Idle contexts kept past this many are disposed.
+const MAX_IDLE_CONTEXTS = 4
 
 // A day: no limit in practice, and inside every timer's range. A run never
 // times out; the plugin moves a long one to the background instead.
 export const NO_LIMIT_MS = 86_400_000
 
 const tickets = new Map<string, Ticket>()
+// `keep`'s values by key, here on the host so they outlive a replaced VM.
+const kept = new Map<string, JsonValue>()
+const jsonValueSchema = z.json()
 
-// What the program sees as `tools`, over the frozen `codemode` host collection.
+// The program's globals, from guest.ts's source, bound to its run.
 export function guestPrelude(runId: string) {
-  return [
-    `const runId = ${JSON.stringify(runId)};`,
-    'const settled = async ({ ticket }) => { for (;;) { const round = await codemode.wait({ ticket }); if (round.done) { if (round.error !== undefined) throw new Error(round.error); return round.value } } };',
-    'const tools = {',
-    '  call: async (name, input) => settled(await codemode.call({ runId, name, input })),',
-    '  search: (query) => codemode.search({ runId, query }),',
-    '  zoom: async (filePath, region) => settled(await codemode.zoom({ runId, filePath, region })),',
-    '  stopRun: (otherRunId) => codemode.stopRun({ runId: otherRunId }),',
-    '};',
-  ].join(' ')
+  return `const { tools, $, read, write, edit, keep } = (${guestApi.toString()})(${JSON.stringify(runId)});`
 }
 
 // The VM runs use now, made on first use.
@@ -52,6 +74,23 @@ export function vmInUse(runs: RunLookup) {
   current ??= startVm(0, runs)
 
   return current
+}
+
+// An idle context, or a new one when every one is busy.
+export function takeContext(vmUsed: VmGeneration) {
+  const idle = vmUsed.idleContexts.pop()
+
+  return idle === undefined ? vmUsed.vm.createContext() : Promise.resolve(idle)
+}
+
+// A context back in the pool after its run, or disposed when the run was
+// stopped (it may have been mid host call) or the pool is full.
+export async function releaseContext(vmUsed: VmGeneration, context: Context, reusable: boolean) {
+  if (reusable && vmUsed.idleContexts.length < MAX_IDLE_CONTEXTS) {
+    vmUsed.idleContexts.push(context)
+  } else {
+    await context.dispose().catch(() => undefined)
+  }
 }
 
 // Replaces a VM that failed, once however many runs saw it fail. A VM that
@@ -62,7 +101,7 @@ export async function replaceVm(failed: VmGeneration, runs: RunLookup) {
   }
 
   current = (async () => {
-    await Promise.race([failed.vm.dispose().catch(() => undefined), Bun.sleep(VM_DISPOSE_WAIT_MS)])
+    await Promise.race([disposeVm(failed), Bun.sleep(VM_DISPOSE_WAIT_MS)])
     await shutdown().catch(() => undefined)
 
     return startVm(failed.generation + 1, runs)
@@ -74,6 +113,14 @@ export async function replaceVm(failed: VmGeneration, runs: RunLookup) {
     process.stderr.write(`codemode: the VM could not be made again: ${String(cause)}\n`)
     process.exit(1)
   }
+}
+
+// Contexts first: a VM disposed with one still open logs a forced finalize
+// (measured).
+export async function disposeVm(vmUsed: VmGeneration) {
+  const idle = vmUsed.idleContexts.splice(0)
+  await Promise.all(idle.map((context) => context.dispose().catch(() => undefined)))
+  await vmUsed.vm.dispose().catch(() => undefined)
 }
 
 export function forgetTickets(runId: string) {
@@ -109,8 +156,38 @@ async function startVm(generation: number, runs: RunLookup): Promise<VmGeneratio
           inputSchema: z
             .object({ runId: z.string(), filePath: z.string(), region: zoomRegionSchema })
             .describe('Start zooming into part of an image file; wait on its ticket.'),
-          execute: (zoom: { runId: string; filePath: string; region: ZoomRegion }) =>
-            issueTicket(zoom.runId, () => zoomFile(zoom.runId, zoom.filePath, zoom.region)),
+          execute: ({
+            runId,
+            filePath,
+            region,
+          }: {
+            runId: string
+            filePath: string
+            region: ZoomRegion
+          }) =>
+            issueTicket(runId, () => zoomFile(runId, resolve(runs.cwdOf(runId), filePath), region)),
+        },
+        shell: {
+          inputSchema: shellRequestSchema.describe('Start a `$` command; wait on its ticket.'),
+          execute: (request: ShellRequest) =>
+            issueTicket(request.runId, () => runShell(request, runs.cwdOf(request.runId))),
+        },
+        read: {
+          inputSchema: readRequestSchema.describe(
+            "Start reading a file's text; wait on its ticket.",
+          ),
+          execute: (request: ReadRequest) =>
+            issueTicket(request.runId, () => readText(request, runs.cwdOf(request.runId))),
+        },
+        write: {
+          inputSchema: writeRequestSchema.describe('Start writing a file; wait on its ticket.'),
+          execute: (request: WriteRequest) =>
+            issueTicket(request.runId, () => writeFile(request, runs.cwdOf(request.runId))),
+        },
+        edit: {
+          inputSchema: editRequestSchema.describe('Start editing a file; wait on its ticket.'),
+          execute: (request: EditRequest) =>
+            issueTicket(request.runId, () => editFile(request, runs.cwdOf(request.runId))),
         },
         wait: {
           inputSchema: z
@@ -125,9 +202,34 @@ async function startVm(generation: number, runs: RunLookup): Promise<VmGeneratio
           execute: async ({ runId, query }: { runId: string; query: string }) =>
             searchCatalog(runs.catalogOf(runId), await currentToolInputTypes(), query),
         },
+        runs: {
+          inputSchema: z.object({}).describe('The runs still going.'),
+          execute: () => runs.running(),
+        },
         stopRun: {
           inputSchema: z.object({ runId: z.string() }).describe('Stop another run.'),
           execute: ({ runId }: { runId: string }) => runs.stopRun(runId, 'another run stopped it'),
+        },
+        keepGet: {
+          inputSchema: z.object({ key: z.string() }).describe('A kept value.'),
+          execute: ({ key }: { key: string }) => ({
+            found: kept.has(key),
+            value: kept.get(key) ?? null,
+          }),
+        },
+        keepSet: {
+          inputSchema: z
+            .object({ key: z.string(), json: z.string() })
+            .describe('Keep a value, sent as JSON text, for later runs.'),
+          execute: ({ key, json }: { key: string; json: string }) => {
+            kept.set(key, jsonValueSchema.parse(JSON.parse(json)))
+
+            return null
+          },
+        },
+        keepDelete: {
+          inputSchema: z.object({ key: z.string() }).describe('Forget a kept value.'),
+          execute: ({ key }: { key: string }) => kept.delete(key),
         },
       },
     },
@@ -137,7 +239,7 @@ async function startVm(generation: number, runs: RunLookup): Promise<VmGeneratio
     },
   })
 
-  return { vm, generation }
+  return { vm, generation, idleContexts: [] }
 }
 
 function issueTicket(runId: string, work: () => Promise<JsonValue>) {

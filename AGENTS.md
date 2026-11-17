@@ -18,14 +18,20 @@ hooks/server-connection.ts   # asks the server; checks, kills and replaces one t
 hooks/tool-relay.ts          # runs the programs' tool calls and posts the answers back
 hooks/codemode.test.ts       # `claude plugin test .`
 codemode/server.ts           # Bun child: socket server, runs by id, stopping them
-codemode/program.ts          # one program: type check, evaluate, its reply; VM failures spotted
-codemode/vm.ts               # the VM, made again when it fails; host functions; tool call tickets
+codemode/program.ts          # one program: type check, evaluate in a pooled context, its reply; VM failures spotted
+codemode/checker.ts          # warm TypeScript language service: type check, last expression returned, types stripped
+codemode/guest.ts            # guestApi: the program's globals ($, read, write, edit, keep, tools), injected as source
+codemode/shorthands.ts       # host side of $, read, write, edit: quoting, relative paths, results parsed
+codemode/scratch.ts          # the server's own TMPDIR, gone servers' swept; imported first by server.ts
+codemode/vm.ts               # the VM, made again when it fails; context pool; host functions; tickets; keep
 codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output
 codemode/image.ts            # returned pictures out of the value, PDF page pictures, zoom
 codemode/png.ts              # Bun.Image's RGBA PNGs to pixels and back, for the crop
 codemode/catalog.ts          # tool input types from the generated d.ts, type-check prelude, search
 codemode/server.spec.ts      # `bun test`; spec-harness.ts spawns the real server and plays the plugin
-codemode/package.json        # runtime deps only (secure-exec, zod), `bun install`ed on first session start
+codemode/shorthands.spec.ts  # the shorthands, keep, runs, cap, background pictures, scratch directory
+codemode/spec-answers.ts     # the canned tool answers and fixture files the specs' stand-in engine uses
+codemode/package.json        # runtime deps only (secure-exec, typescript, zod), `bun install`ed on first session start
 package.json                 # dev tooling only: oxlint, oxfmt, begone-slop, typescript, @types/bun
 .githooks/                   # pre-commit and pre-push, wired by `prepare`
 .claude/settings.json        # developing this repo only: refuses Bash commands that skip the hooks
@@ -87,7 +93,35 @@ protocol alone.
   `stdout` at 30,000 characters) and saves it under `<config>/projects/*/tool-results/`; the relay
   reads that file back, from no other directory. Read past its 256 KB cap is read again in pages
   with `offset` and `limit`.
-- Host function schemas reject `z.unknown()`; use `z.looseObject({})`.
+- Host function schemas reject `z.unknown()`; use `z.looseObject({})`. Loose values (`$`'s
+  interpolations, `keep`'s values) travel as JSON text and are parsed with zod on the host.
+- Type checks run on the host, in a TypeScript 6 language service kept warm (`checker.ts`):
+  Secure Exec's `vm.typescript.check` boots a compiler per call, ~1.4 s even for one line, against
+  6–19 ms warm (measured). It mirrors what that check accepted: libs esnext + dom, `strict: false`
+  (TypeScript 6 defaults to strict). TypeScript 7 is the Go port with only `unstable/*` APIs, so
+  it stays a dev tool here.
+- A program's last statement, when an expression, becomes its `return`. Its value is passed through
+  JSON in the guest: Secure Exec fails an `undefined` value with `evaluation_serialization_failed`
+  (measured), so no value reads as `null`, shown as the console output alone or `(no value)`.
+- `transpileModule` puts `"use strict";` first; an evaluated expression cannot hold it, so
+  `stripTypes` drops it and the closing `;`.
+- Runs evaluate in contexts from a pool, one per run going side by side, never reset: a warm
+  context evaluates in ~9 ms against ~95 ms fresh, and a reset context is cold again (measured).
+  A stopped run's context is disposed; contexts are disposed before their VM, which otherwise logs
+  `ERR_AGENTOS_VM_FORCED_PROCESS_FINALIZE`.
+- `$` is Bun Shell's API, not Bun: the guest is Secure Exec's V8, and a host-side `Bun.$` would
+  skip every permission check. Each command is a relayed Bash call. Bash merges stderr into stdout
+  and gives no exit code in its record: a failed command's text opens `Exit code N` (measured).
+  The description says "Bun Shell's `$`", never that the VM is Bun.
+- `guest.ts` reaches the VM as `guestApi.toString()` (Bun's transpiled source), so it may use
+  nothing outside its own body. The host functions behind it are ticketed like `codemode.call`.
+- The server points `TMPDIR` at `$TMPDIR/claude-codemode/<pid>/` before Secure Exec loads: the
+  sidecar's shadow roots, sockets and import caches (~21 MB each) went there, not loose in /tmp
+  where a killed server left them for good (1.2 GB measured). On start, directories whose pid no
+  longer runs are swept.
+- With Claude Code's own Code Mode on (a `REPL` tool at `session.start`), codemode registers
+  nothing and leaves tool descriptions alone. The test kit cannot raise `session.start`, so this
+  has no hooks test.
 - Pictures reach the model only when the program returns them. The server swaps each one's
   `base64` for `[image N]` and keeps the rest of its record; `run` answers with a text block and
   `{ type: 'image', source: { type: 'base64', media_type, data } }` blocks. The engine refuses an
@@ -95,7 +129,8 @@ protocol alone.
 - Read with `pages` hands a plugin the PDF's `outputDir`, never the page pictures: the server loads
   `page-N.*` from there after the relayed Read.
 - `tools.zoom` relays Read first as its permission check (`discardResult`, so the picture's bytes
-  don't travel back) and takes absolute paths only, so both name the same file. `Bun.Image` has no crop: `png.ts` slices its RGBA PNG output, then
+  don't travel back), and a relative path is resolved against the session's directory first, so both
+  name the same file. `Bun.Image` has no crop: `png.ts` slices its RGBA PNG output, then
   `Bun.Image` enlarges each pixel to a block up to Read's 2000 px long edge.
 - No `idleTimeout` on `Bun.serve`: a Unix socket has none, and a run never times out.
 - `$.http.fetch` aborts any request after 30 s, undocumented. `/run` and `/wait` answer within
@@ -168,7 +203,7 @@ Type-aware lint over all of `hooks/` can be killed (tsgolint `SIGTERM`, about 30
 
 - `hooks/*.test.ts` run against the engine via `claude plugin test`. Nothing sits beneath the
   plugin's hooks in a test, so add stand-in `on(...)` hooks for the engine's side.
-- `codemode/server.spec.ts` runs on `bun test`; `spec-harness.ts` spawns the real server and plays
-  the plugin with canned answers. A type check costs about 1.5 s per run, so keep the suite small.
+- `codemode/*.spec.ts` run on `bun test`; `spec-harness.ts` spawns the real server once for every
+  spec file and plays the plugin with canned answers from `spec-answers.ts`.
   It is `.spec.ts` because `claude plugin test .` loads every `*.test.ts` under the plugin root as
   a hooks test, and cannot be scoped to `hooks/`.
