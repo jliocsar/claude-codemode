@@ -1,0 +1,3 @@
+[test]
+# After every spec file: stop the one server they share, remove the fixtures.
+preload = ["./spec-cleanup.ts"]

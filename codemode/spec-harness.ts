@@ -67,11 +67,6 @@ export const server = Bun.spawn(['bun', 'server.ts'], {
 export const seenToolCalls: ToolCallInput[] = []
 const serverSocketPath = waitForServerSocketPath()
 
-// Every spec file shares this one server; it stops when the test process does.
-process.once('exit', () => {
-  server.kill('SIGTERM')
-})
-
 export async function post(path: string, bodyJson: string) {
   const response = await fetch(`http://codemode${path}`, {
     unix: await serverSocketPath,

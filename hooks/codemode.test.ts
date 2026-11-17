@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { callLogLine, callLogSink } from './call-log'
 import { finishedBackgroundRunText, runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
@@ -116,4 +117,33 @@ test('a background run comes back as a message, counting the pictures it cannot 
   expect(message).toMatch(
     /^codemode: background run run-1 finished\.\n\nbuilt\n\n\(1 returned picture/u,
   )
+})
+test('each relayed call gets a short transcript line, its outcome after', () => {
+  const cwd = '/repo'
+  const edit = callLogLine(
+    { tool: 'Edit', file_path: '/repo/src/a.ts', old_string: 'one', new_string: 'two\nthree' },
+    { denied: false, isError: false, text: '' },
+    cwd,
+  )
+  const failedCommand = callLogLine(
+    { tool: 'Bash', command: 'npm test\nnpm run lint' },
+    { denied: false, isError: true, text: 'Exit code 2\nboom' },
+    cwd,
+  )
+  const deniedRead = callLogLine({ tool: 'Read', file_path: '/etc/hosts' }, { denied: true }, cwd)
+
+  expect([edit, failedCommand, deniedRead]).toEqual([
+    'codemode ↳ Edit src/a.ts +2 −1',
+    'codemode ↳ $ npm test… — exit 2',
+    'codemode ↳ Read /etc/hosts — denied',
+  ])
+})
+
+test('the call log goes to the transcript unless set to debug or off', () => {
+  expect([
+    callLogSink(undefined),
+    callLogSink('debug'),
+    callLogSink('off'),
+    callLogSink('x'),
+  ]).toEqual(['transcript', 'debug', 'off', 'transcript'])
 })
