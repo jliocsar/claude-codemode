@@ -9,12 +9,14 @@ import {
   type ReadyLine,
   type ServerState,
 } from './server-connection'
+import { describeServerExit } from './server-exit'
 import { answerToolCall } from './tool-relay'
 
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 const INSTALL_ERROR_CHARACTERS = 500
-const EXIT_REASON_CHARACTERS = 500
+// Kept for the debug log; the person reads describeServerExit's few words.
+const EXIT_REASON_CHARACTERS = 2_000
 // Bun.Image, which zooming needs, is in Bun 1.4 on.
 const MINIMUM_BUN_VERSION = [1, 4] as const
 // The server is started again after it exits, unless it keeps exiting.
@@ -82,7 +84,7 @@ export async function superviseServer($: EngineInterface, server: ServerState) {
     server.current = pendingConnection()
 
     if (exits.length > MAX_RESTARTS_IN_WINDOW) {
-      const reason = `the codemode server exited ${exits.length} times in five minutes; last: ${exitReason}`
+      const reason = `the server stopped ${exits.length} times in five minutes, so it stays off; last, it ${exitReason}`
       server.current.settle({ kind: 'unavailable', reason })
       previous.settle(server.current.promise)
       $.ui.log(reason)
@@ -92,7 +94,7 @@ export async function superviseServer($: EngineInterface, server: ServerState) {
 
     // Runs still waiting on the spawn that just ended wait on the next one.
     previous.settle(server.current.promise)
-    $.ui.log(`the server exited (${exitReason}); starting it again`)
+    $.ui.log(`the server ${exitReason}; starting it again`)
     await $.clock.sleep(RESTART_DELAY_MS)
   }
 }
@@ -122,9 +124,9 @@ async function runServerOnce(
 
       if (piece.done === true) {
         const { code, signal } = piece.value
-        const how = signal === null ? `code ${String(code)}` : `signal ${signal}`
+        $.ui.log(`the server's last stderr: ${stderrTail.trim()}`, { to: 'debug' })
 
-        return stderrTail.trim() === '' ? how : `${how}: ${stderrTail.trim()}`
+        return describeServerExit({ code, signal }, stderrTail)
       }
 
       if (piece.value.stream === 'stderr') {
@@ -147,7 +149,7 @@ async function runServerOnce(
       }
     }
   } catch (cause) {
-    return errorText(cause)
+    return `could not be run: ${errorText(cause)}`
   }
 }
 

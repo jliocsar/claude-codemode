@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { callLogLine, callLogMode, runSummaryLine } from './call-log'
 import { subagentCall } from './run-owners'
+import { describeServerExit } from './server-exit'
 import { finishedBackgroundRunText, runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
@@ -186,4 +187,23 @@ test("a subagent's run keeps Bash in the foreground, so no notice reaches the pa
   expect(subagentCall({ tool: 'Read', file_path: '/a' })).toEqual({
     input: { tool: 'Read', file_path: '/a' },
   })
+})
+test("a server's exit reads plainly, the VM runtime's chatter left out", () => {
+  const chatter = [
+    '148',
+    'agentos-v8-runtime: warm worker pool-empty key=4e1f6906 heap=128',
+    'agentos-v8-runtime: restored session isolate from_snapshot=true',
+    'ts=2026-11-17T16:54:18.102Z level=info message="sidecar process started"',
+    'ERR_AGENTOS_VM_FORCED_PROCESS_FINALIZE: vm_id=vm-1 process_count=1',
+  ].join('�')
+
+  expect(describeServerExit({ code: null, signal: 'SIGKILL' }, chatter)).toBe(
+    'was killed (SIGKILL: out of memory, or killed from outside)',
+  )
+  expect(
+    describeServerExit(
+      { code: 1, signal: null },
+      `${chatter}\nerror: Cannot find module 'secure-exec'\n`,
+    ),
+  ).toBe("exited with code 1: error: Cannot find module 'secure-exec'")
 })

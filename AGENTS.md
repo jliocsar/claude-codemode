@@ -14,6 +14,7 @@ reaches tools only through `tools.call(name, input)`, `tools.search(query)`,
 hooks/register.ts            # plugin side: registers `run`, hides relayed tools, runs and backgrounds runs
 hooks/run-tool.ts            # `run`'s name, schema, description, the tools it relays; its result
 hooks/server-process.ts      # spawns the server, and again whenever it exits
+hooks/server-exit.ts         # why the server stopped, in plain words: its stderr's runtime chatter left out
 hooks/server-connection.ts   # asks the server; checks, kills and replaces one that stopped answering
 hooks/tool-relay.ts          # runs the programs' tool calls and posts the answers back
 hooks/call-log.ts            # opt-in rows summing up a run's calls (CLAUDE_CODEMODE_CALL_LOG, off by default)
