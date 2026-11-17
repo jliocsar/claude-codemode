@@ -76,7 +76,7 @@ declare const inputs: any
 
 Pictures reach you only when returned: Read's \`result\` for an image or PDF, or zoom's.
 Search for a tool before calling one whose input you don't know.
-A run past 2 min moves to the background; its result arrives later as a message, so don't poll.
+A run past 2 min moves to the background (in a subagent, it's waited out); its result arrives later as a message, so don't poll.
 Text with quotes, backticks or backslashes goes in \`inputs\`, never inline in \`code\`.
 No network or real filesystem: these globals are the only way out, under the usual permissions.`
 

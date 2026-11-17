@@ -29,7 +29,9 @@ usual permissions.
 Nothing times out unless you set `CLAUDE_CODEMODE_MAX_RUN_MS`. A run still going after two minutes
 moves to the background, the way a long Bash command does: the model gets its id at once and its
 result as a message when it ends, with any pictures it returned saved as files.
-`CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` sets another wait. Interrupting a run stops its program. If
+`CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` sets another wait. In a subagent a run is waited out instead,
+and its Bash calls run in the foreground: whatever a plugin sends from the background reaches the
+main conversation, not the subagent. Interrupting a run stops its program. If
 the server or its VM dies (killed, out of memory, a crashed sidecar), it's started again on its
 own, with no need to restart the session.
 

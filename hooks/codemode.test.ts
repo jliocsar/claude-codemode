@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { callLogLine, callLogMode, runSummaryLine } from './call-log'
+import { subagentCall } from './run-owners'
 import { finishedBackgroundRunText, runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
@@ -171,4 +172,18 @@ test('the call log is a row per run unless set to calls, debug or off', () => {
     'off',
     'run',
   ])
+})
+test("a subagent's run keeps Bash in the foreground, so no notice reaches the parent session", () => {
+  expect(subagentCall({ tool: 'Bash', command: 'make', run_in_background: true })).toEqual({
+    refusal: expect.stringContaining('parent session'),
+  })
+  expect(subagentCall({ tool: 'Bash', command: 'make' })).toEqual({
+    input: { tool: 'Bash', command: 'make', timeout: 600_000 },
+  })
+  expect(subagentCall({ tool: 'Bash', command: 'make', timeout: 5000 })).toEqual({
+    input: { tool: 'Bash', command: 'make', timeout: 5000 },
+  })
+  expect(subagentCall({ tool: 'Read', file_path: '/a' })).toEqual({
+    input: { tool: 'Read', file_path: '/a' },
+  })
 })

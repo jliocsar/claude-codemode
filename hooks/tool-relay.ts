@@ -11,6 +11,7 @@ import {
   runSummaryLine,
   takeRunCalls,
 } from './call-log'
+import { isSubagentRun, subagentCall } from './run-owners'
 import { isRelayedTool } from './run-tool'
 import { errorText } from './server-connection'
 
@@ -108,7 +109,18 @@ async function runRelayedTool(
   toolCallLine: ToolCallLine,
   customTools: readonly string[],
 ) {
-  const { callId, input, discardResult = false } = toolCallLine
+  const { callId, runId, discardResult = false } = toolCallLine
+  const asked = isSubagentRun(runId)
+    ? subagentCall(toolCallLine.input)
+    : { input: toolCallLine.input }
+
+  if (asked.refusal !== undefined) {
+    void logCall($, toolCallLine, { denied: true })
+
+    return { callId, outcome: 'denied', reason: asked.refusal }
+  }
+
+  const { input } = asked
 
   if (!isRelayedTool(input.tool, customTools)) {
     return {

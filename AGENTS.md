@@ -17,6 +17,7 @@ hooks/server-process.ts      # spawns the server, and again whenever it exits
 hooks/server-connection.ts   # asks the server; checks, kills and replaces one that stopped answering
 hooks/tool-relay.ts          # runs the programs' tool calls and posts the answers back
 hooks/call-log.ts            # a dim transcript row per run summing up its calls (CLAUDE_CODEMODE_CALL_LOG)
+hooks/run-owners.ts          # runs a subagent started: never backgrounded, Bash kept in the foreground
 hooks/codemode.test.ts       # `claude plugin test .`
 codemode/server.ts           # Bun child: socket server, runs by id, stopping them
 codemode/program.ts          # one program: type check, evaluate in a pooled context, its reply; VM failures spotted
@@ -125,6 +126,12 @@ protocol alone.
   (a row per call was a wall of rows), which the model never reads; the Edit and Write line counts
   come from the input, not the result. The engine leads every `$.ui.log` row with `codemode:`
   already, so no text adds it. Tool call lines carry their `runId` for this.
+- A plugin's `$.prompt.submit` and `$.tool.call` act in the main loop, never a subagent's (only
+  the test kit's `$.tool.call` takes an `agentId`): a subagent's background run reply and the
+  completion notice of its relayed Bash `run_in_background` both landed in the parent session
+  (seen). So a run whose `tool.call` carries an `agentId` is never backgrounded, and its relayed
+  Bash refuses `run_in_background` and gets Bash's longest timeout (600 s) when it set none, since
+  past its default 2 min the engine backgrounds a command itself (`run-owners.ts`).
 - With Claude Code's own Code Mode on (a `REPL` tool at `session.start`), codemode registers
   nothing and leaves tool descriptions alone. The test kit cannot raise `session.start`, so this
   has no hooks test.

@@ -18,6 +18,7 @@ import {
   stopServerRun,
 } from './server-connection'
 import { superviseServer } from './server-process'
+import { forgetRunAgent, rememberRunAgent } from './run-owners'
 import { customConversationTools, logRunSummary } from './tool-relay'
 
 // Code mode: one `run` tool replaces every tool that only moves data. The model
@@ -85,6 +86,10 @@ export const register: Register = (on) => {
     const interrupted = whenAborted(next.signal)
     const ask = (path: '/run' | '/wait', bodyJson: string) =>
       Promise.race([askServer($, server, path, bodyJson), interrupted])
+    // A subagent's run is waited out: what reaches the session from the
+    // background reaches the main loop, not the subagent (run-owners.ts).
+    const mayBackground = event.agentId === undefined
+    rememberRunAgent(runId, event.agentId)
 
     try {
       const runJson = JSON.stringify({
@@ -103,7 +108,7 @@ export const register: Register = (on) => {
       while (reply !== 'interrupted' && reply.pendingRunId !== undefined) {
         const elapsedMs = Date.now() - startedAt
 
-        if (elapsedMs >= (backgroundAfterMs ?? BACKGROUND_AFTER_MS)) {
+        if (mayBackground && elapsedMs >= (backgroundAfterMs ?? BACKGROUND_AFTER_MS)) {
           backgroundRuns.push(runId)
 
           return { result: backgroundedRunText(runId, elapsedMs) }
@@ -126,6 +131,8 @@ export const register: Register = (on) => {
       await logRunSummary($, runId)
 
       return { deny: `codemode server unavailable: ${errorText(cause)}` }
+    } finally {
+      forgetRunAgent(runId)
     }
   })
 
