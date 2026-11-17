@@ -33,9 +33,10 @@ result as a message when it ends, with any pictures it returned saved as files.
 the server or its VM dies (killed, out of memory, a crashed sidecar), it's started again on its
 own, with no need to restart the session.
 
-Each tool call a program makes shows as a dim row under the `run` call, such as
-`codemode ↳ Edit src/a.ts +2 −1` or `codemode ↳ $ npm test — exit 1`; the model never reads them.
-`CLAUDE_CODEMODE_CALL_LOG=debug` sends them to the debug log instead, `off` drops them.
+Each run ends with one dim row summing up the tool calls it made, such as
+`↳ $ ×7 · Read · Edit · edited src/a.ts +2 −1 · $ npm test — exit 1`; the model never reads it.
+`CLAUDE_CODEMODE_CALL_LOG=calls` shows a row per call instead, `debug` sends those to the debug log,
+and `off` drops them.
 
 The VM's temporary files live in `$TMPDIR/claude-codemode/<server pid>/`, removed when the server
 stops, and swept by the next server when it was killed.

@@ -67,7 +67,7 @@ export async function superviseServer($: EngineInterface, server: ServerState) {
     await installServer($, serverDirectory)
   } catch (cause) {
     server.current.settle({ kind: 'unavailable', reason: errorText(cause) })
-    $.ui.log(`codemode: the server did not start: ${errorText(cause)}`)
+    $.ui.log(`the server did not start: ${errorText(cause)}`)
 
     return
   }
@@ -85,14 +85,14 @@ export async function superviseServer($: EngineInterface, server: ServerState) {
       const reason = `the codemode server exited ${exits.length} times in five minutes; last: ${exitReason}`
       server.current.settle({ kind: 'unavailable', reason })
       previous.settle(server.current.promise)
-      $.ui.log(`codemode: ${reason}`)
+      $.ui.log(reason)
 
       return
     }
 
     // Runs still waiting on the spawn that just ended wait on the next one.
     previous.settle(server.current.promise)
-    $.ui.log(`codemode: the server exited (${exitReason}); starting it again`)
+    $.ui.log(`the server exited (${exitReason}); starting it again`)
     await $.clock.sleep(RESTART_DELAY_MS)
   }
 }

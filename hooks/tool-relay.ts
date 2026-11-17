@@ -2,7 +2,15 @@
 // under the session's permissions, and answered over the server's socket.
 
 import type { EngineInterface } from 'claude-code'
-import { type CallLogSink, type CallOutcome, callLogLine, callLogSink } from './call-log'
+import {
+  type CallLogMode,
+  type CallOutcome,
+  callLogLine,
+  callLogMode,
+  recordCall,
+  runSummaryLine,
+  takeRunCalls,
+} from './call-log'
 import { isRelayedTool } from './run-tool'
 import { errorText } from './server-connection'
 
@@ -10,7 +18,12 @@ type ToolCallInput = Parameters<EngineInterface['tool']['call']>[0]
 
 // One stdout line from the codemode server, after its prefix. `discardResult`:
 // the call is a permission check, and its answer carries no output.
-type ToolCallLine = { callId: string; input: ToolCallInput; discardResult?: boolean }
+type ToolCallLine = {
+  callId: string
+  runId: string
+  input: ToolCallInput
+  discardResult?: boolean
+}
 
 const ANSWER_ATTEMPTS = 3
 const ANSWER_RETRY_MS = 500
@@ -30,7 +43,7 @@ async function readCustomConversationTools($: EngineInterface): Promise<readonly
 
     return (listed ?? '').split(',').flatMap((entry) => entry.trim() || [])
   } catch (cause) {
-    $.ui.log(`codemode: reading custom conversation tools failed: ${errorText(cause)}`)
+    $.ui.log(`reading custom conversation tools failed: ${errorText(cause)}`)
 
     return []
   }
@@ -44,30 +57,49 @@ function callLogSettings($: EngineInterface) {
       $.session.cwd(),
     ])
 
-    return { sink: callLogSink(configured), cwd }
+    return { mode: callLogMode(configured), cwd }
   })()
 
   return callLogRead
 }
 
-// A permission check (`discardResult`, zoom's Read) is not a call the program made.
+// Kept for the run's row, or shown at once with a row per call. A permission
+// check (`discardResult`, zoom's Read) is not a call the program made.
 async function logCall(
   $: EngineInterface,
-  { input, discardResult }: ToolCallLine,
+  { runId, input, discardResult }: ToolCallLine,
   outcome: CallOutcome,
 ) {
   if (discardResult === true) {
     return
   }
 
-  try {
-    const { sink, cwd } = await callLogSettings($)
+  recordCall(runId, input, outcome)
 
-    if (sink !== 'off') {
-      $.ui.log(callLogLine(input, outcome, cwd), { to: sink })
+  try {
+    const { mode, cwd } = await callLogSettings($)
+
+    if (mode === 'calls' || mode === 'debug') {
+      $.ui.log(callLogLine(input, outcome, cwd), { to: mode === 'calls' ? 'transcript' : 'debug' })
     }
   } catch (cause) {
-    $.ui.log(`codemode: logging a tool call failed: ${errorText(cause)}`, { to: 'debug' })
+    $.ui.log(`logging a tool call failed: ${errorText(cause)}`, { to: 'debug' })
+  }
+}
+
+// The run's one row, once it ended (finished, failed or stopped).
+export async function logRunSummary($: EngineInterface, runId: string) {
+  const calls = takeRunCalls(runId)
+
+  try {
+    const { mode, cwd } = await callLogSettings($)
+    const line = mode === 'run' ? runSummaryLine(calls, cwd) : null
+
+    if (line !== null) {
+      $.ui.log(line)
+    }
+  } catch (cause) {
+    $.ui.log(`logging a run failed: ${errorText(cause)}`, { to: 'debug' })
   }
 }
 
@@ -123,7 +155,7 @@ export async function answerToolCall($: EngineInterface, socketPath: string, too
     const answer = await runRelayedTool($, toolCallLine, await customConversationTools($))
     answerJson = JSON.stringify(answer)
   } catch (cause) {
-    $.ui.log(`codemode: a tool call line could not be read: ${errorText(cause)}`)
+    $.ui.log(`a tool call line could not be read: ${errorText(cause)}`)
 
     return
   }
@@ -134,7 +166,7 @@ export async function answerToolCall($: EngineInterface, socketPath: string, too
 
       return
     } catch (cause) {
-      $.ui.log(`codemode: answering a tool call failed (try ${attempt}): ${errorText(cause)}`, {
+      $.ui.log(`answering a tool call failed (try ${attempt}): ${errorText(cause)}`, {
         to: 'debug',
       })
       await $.clock.sleep(ANSWER_RETRY_MS * attempt)
@@ -145,4 +177,4 @@ export async function answerToolCall($: EngineInterface, socketPath: string, too
 // What readCustomConversationTools found, read once a session.
 let customToolsRead: Promise<readonly string[]> | undefined
 // The call log's sink and the session's directory, read once a session.
-let callLogRead: Promise<{ sink: CallLogSink; cwd: string }> | undefined
+let callLogRead: Promise<{ mode: CallLogMode; cwd: string }> | undefined

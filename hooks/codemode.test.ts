@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { callLogLine, callLogSink } from './call-log'
+import { callLogLine, callLogMode, runSummaryLine } from './call-log'
 import { finishedBackgroundRunText, runResult } from './run-tool'
 
 const ENGINE_PROVIDER = { plugin: 'engine', tier: 'core' } as const
@@ -118,32 +118,57 @@ test('a background run comes back as a message, counting the pictures it cannot 
     /^codemode: background run run-1 finished\.\n\nbuilt\n\n\(1 returned picture/u,
   )
 })
-test('each relayed call gets a short transcript line, its outcome after', () => {
+test('a run sums up its calls in one row: counts, edited files, what went wrong', () => {
   const cwd = '/repo'
-  const edit = callLogLine(
-    { tool: 'Edit', file_path: '/repo/src/a.ts', old_string: 'one', new_string: 'two\nthree' },
-    { denied: false, isError: false, text: '' },
+  const ok = { denied: false, isError: false, text: '' } as const
+  const line = runSummaryLine(
+    [
+      { input: { tool: 'Bash', command: "cd '/repo/pkgs' && grep -rn x ." }, outcome: ok },
+      { input: { tool: 'Read', file_path: '/repo/a.ts' }, outcome: ok },
+      {
+        input: {
+          tool: 'Edit',
+          file_path: '/repo/a.ts',
+          old_string: 'one',
+          new_string: 'two\nthree',
+        },
+        outcome: ok,
+      },
+      {
+        input: { tool: 'Edit', file_path: '/repo/a.ts', old_string: 'x', new_string: 'y' },
+        outcome: ok,
+      },
+      {
+        input: { tool: 'Bash', command: 'cd /repo && npm test' },
+        outcome: { denied: false, isError: true, text: 'Exit code 2\nboom' },
+      },
+      { input: { tool: 'Read', file_path: '/etc/hosts' }, outcome: { denied: true } },
+    ],
     cwd,
   )
-  const failedCommand = callLogLine(
-    { tool: 'Bash', command: 'npm test\nnpm run lint' },
-    { denied: false, isError: true, text: 'Exit code 2\nboom' },
-    cwd,
-  )
-  const deniedRead = callLogLine({ tool: 'Read', file_path: '/etc/hosts' }, { denied: true }, cwd)
 
-  expect([edit, failedCommand, deniedRead]).toEqual([
-    'codemode ↳ Edit src/a.ts +2 −1',
-    'codemode ↳ $ npm test… — exit 2',
-    'codemode ↳ Read /etc/hosts — denied',
-  ])
+  expect(line).toBe(
+    '↳ $ ×2 · Read ×2 · Edit ×2 · edited a.ts +3 −2 · $ npm test — exit 2, Read /etc/hosts — denied',
+  )
+  expect(runSummaryLine([], cwd)).toBe(null)
 })
 
-test('the call log goes to the transcript unless set to debug or off', () => {
-  expect([
-    callLogSink(undefined),
-    callLogSink('debug'),
-    callLogSink('off'),
-    callLogSink('x'),
-  ]).toEqual(['transcript', 'debug', 'off', 'transcript'])
+test('a row per call drops the leading cd and the plugin name the engine adds itself', () => {
+  const line = callLogLine(
+    { tool: 'Bash', command: 'cd /repo/pkgs && npm pack x\nls' },
+    { denied: false, isError: false, text: '' },
+    '/repo',
+  )
+
+  expect(line).toBe('↳ $ npm pack x…')
+})
+
+test('the call log is a row per run unless set to calls, debug or off', () => {
+  expect([undefined, 'calls', 'debug', 'off', 'x'].map(callLogMode)).toEqual([
+    'run',
+    'calls',
+    'debug',
+    'off',
+    'run',
+  ])
 })

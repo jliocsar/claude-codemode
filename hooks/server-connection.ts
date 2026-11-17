@@ -82,7 +82,7 @@ export async function askServer(
   try {
     return await fetchServer($, connection, path, bodyJson)
   } catch (cause) {
-    $.ui.log(`codemode: ${path} failed (${errorText(cause)}); checking the server`, { to: 'debug' })
+    $.ui.log(`${path} failed (${errorText(cause)}); checking the server`, { to: 'debug' })
     const recovered = await recoverServer($, server, connection)
 
     if (path === '/run' && recovered.pid !== connection.pid) {
@@ -140,7 +140,7 @@ async function killServer($: EngineInterface, server: ServerState, failed: Liste
     return
   }
 
-  $.ui.log(`codemode: the server (pid ${failed.pid}) stopped answering; restarting it`)
+  $.ui.log(`the server (pid ${failed.pid}) stopped answering; restarting it`)
   await $.process.run(['kill', String(failed.pid)]).catch(() => undefined)
   await $.clock.sleep(KILL_GRACE_MS)
 
@@ -158,6 +158,6 @@ export async function stopServerRun($: EngineInterface, server: ServerState, run
       body: JSON.stringify({ runId }),
     })
   } catch (cause) {
-    $.ui.log(`codemode: stopping run ${runId} failed: ${errorText(cause)}`, { to: 'debug' })
+    $.ui.log(`stopping run ${runId} failed: ${errorText(cause)}`, { to: 'debug' })
   }
 }

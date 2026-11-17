@@ -1,6 +1,8 @@
-// One dim transcript row per tool call a program makes: the engine shows
-// only the `run` call itself, so without these the person sees no Edit, no
-// command, no file read. `$.ui.log` rows never reach the model.
+// What the person sees of the tool calls a program makes: the engine shows
+// only the `run` call itself, with no row for the Reads, Edits and commands
+// inside it. By default one dim row sums up a run when it ends; with
+// CLAUDE_CODEMODE_CALL_LOG=calls, a row per call. `$.ui.log` rows never reach
+// the model, and the engine leads each with the plugin's name.
 
 import type { EngineInterface } from 'claude-code'
 
@@ -9,12 +11,23 @@ type ToolCallInput = Parameters<EngineInterface['tool']['call']>[0]
 // How the call ended, as the relay saw it.
 export type CallOutcome = { denied: true } | { denied: false; isError: boolean; text: string }
 
-// Where the rows go: CLAUDE_CODEMODE_CALL_LOG is `transcript` (the default),
-// `debug` (the debug log alone) or `off`.
-export type CallLogSink = 'transcript' | 'debug' | 'off'
+// CLAUDE_CODEMODE_CALL_LOG: `run` (a row per run, the default), `calls` (a
+// row per call), `debug` (a row per call, in the debug log alone) or `off`.
+export type CallLogMode = 'run' | 'calls' | 'debug' | 'off'
+
+type CallRecord = { input: ToolCallInput; outcome: CallOutcome }
+
+type FileChange = { path: string; added: number; removed: number }
 
 const COMMAND_CHARACTERS = 80
+const LISTED_FILES = 3
+const LISTED_PROBLEMS = 2
 const EXIT_CODE_LINE = /^Exit code (\d+)/u
+// The `cd <dir> &&` a command opens with says where, not what: dropped from rows.
+const LEADING_CD = /^cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*/u
+
+// The calls of each run still going, by run id, until its row is written.
+const runCalls = new Map<string, CallRecord[]>()
 
 function lineCount(text: string) {
   return text === '' ? 0 : text.replace(/\n$/u, '').split('\n').length
@@ -24,23 +37,38 @@ function shortPath(filePath: string, cwd: string) {
   return filePath.startsWith(`${cwd}/`) ? filePath.slice(cwd.length + 1) : filePath
 }
 
-function firstLine(command: string) {
-  const line = command.trim().split('\n')[0] ?? ''
-  const more = line.length > COMMAND_CHARACTERS || command.trim().includes('\n')
+function shownCommand(command: string) {
+  const trimmed = command.trim().replace(LEADING_CD, '')
+  const line = trimmed.split('\n')[0] ?? ''
+  const more = line.length > COMMAND_CHARACTERS || trimmed.includes('\n')
 
   return more ? `${line.slice(0, COMMAND_CHARACTERS)}…` : line
 }
 
-// What the call did, in a few words: the file and its changed lines, the command.
-function callSummary(input: ToolCallInput, cwd: string) {
+// The lines an Edit or Write changes, from its input: the result's diff is
+// not handed back to a plugin in every case. `replace_all` counts one.
+function fileChange(input: ToolCallInput, cwd: string): FileChange | undefined {
   if (input.tool === 'Edit') {
-    const all = input.replace_all === true ? ' (all)' : ''
-
-    return `Edit ${shortPath(input.file_path, cwd)} +${lineCount(input.new_string)} −${lineCount(input.old_string)}${all}`
+    return {
+      path: shortPath(input.file_path, cwd),
+      added: lineCount(input.new_string),
+      removed: lineCount(input.old_string),
+    }
   }
 
   if (input.tool === 'Write') {
-    return `Write ${shortPath(input.file_path, cwd)} +${lineCount(input.content)}`
+    return { path: shortPath(input.file_path, cwd), added: lineCount(input.content), removed: 0 }
+  }
+
+  return undefined
+}
+
+// What one call did, in a few words: the file and its changed lines, the command.
+function callSummary(input: ToolCallInput, cwd: string) {
+  const change = fileChange(input, cwd)
+
+  if (change !== undefined) {
+    return `${input.tool} ${change.path} +${change.added} −${change.removed}`
   }
 
   if (input.tool === 'Read') {
@@ -48,7 +76,7 @@ function callSummary(input: ToolCallInput, cwd: string) {
   }
 
   if (input.tool === 'Bash') {
-    return `$ ${firstLine(input.command)}`
+    return `$ ${shownCommand(input.command)}`
   }
 
   return input.tool
@@ -68,10 +96,87 @@ function outcomeNote(outcome: CallOutcome) {
   return exitCode === undefined ? ' — failed' : ` — exit ${exitCode}`
 }
 
-export function callLogLine(input: ToolCallInput, outcome: CallOutcome, cwd: string) {
-  return `codemode ↳ ${callSummary(input, cwd)}${outcomeNote(outcome)}`
+function isProblem(outcome: CallOutcome) {
+  return outcome.denied || outcome.isError
 }
 
-export function callLogSink(configured: string | undefined): CallLogSink {
-  return configured === 'debug' || configured === 'off' ? configured : 'transcript'
+// Up to `limit` of the items, and how many more there were.
+function listed(items: readonly string[], limit: number) {
+  const more = items.length - limit
+
+  return more > 0 ? [...items.slice(0, limit), `+${more} more`].join(', ') : items.join(', ')
+}
+
+// Changed files once each, their lines summed over the run's edits.
+function changedFiles(calls: readonly CallRecord[], cwd: string) {
+  const byPath = new Map<string, FileChange>()
+
+  for (const { input } of calls) {
+    const change = fileChange(input, cwd)
+
+    if (change !== undefined) {
+      const seen = byPath.get(change.path)
+      byPath.set(change.path, {
+        path: change.path,
+        added: (seen?.added ?? 0) + change.added,
+        removed: (seen?.removed ?? 0) + change.removed,
+      })
+    }
+  }
+
+  return [...byPath.values()].map(({ path, added, removed }) => `${path} +${added} −${removed}`)
+}
+
+// How many calls of each kind, in the order the run first made them.
+function callCounts(calls: readonly CallRecord[]) {
+  const counts = new Map<string, number>()
+
+  for (const { input } of calls) {
+    const kind = input.tool === 'Bash' ? '$' : input.tool
+    counts.set(kind, (counts.get(kind) ?? 0) + 1)
+  }
+
+  return [...counts].map(([kind, count]) => (count === 1 ? kind : `${kind} ×${count}`))
+}
+
+export function callLogLine(input: ToolCallInput, outcome: CallOutcome, cwd: string) {
+  return `↳ ${callSummary(input, cwd)}${outcomeNote(outcome)}`
+}
+
+// One row for a whole run, or null when it called no tool:
+// `↳ $ ×7 · Read · Edit ×2 · edited src/a.ts +2 −1 · $ npm test — exit 2`.
+export function runSummaryLine(calls: readonly CallRecord[], cwd: string) {
+  if (calls.length === 0) {
+    return null
+  }
+
+  const files = changedFiles(calls, cwd)
+  const problems = calls
+    .filter(({ outcome }) => isProblem(outcome))
+    .map(({ input, outcome }) => `${callSummary(input, cwd)}${outcomeNote(outcome)}`)
+  const parts = [
+    ...callCounts(calls),
+    ...(files.length === 0 ? [] : [`edited ${listed(files, LISTED_FILES)}`]),
+    ...(problems.length === 0 ? [] : [listed(problems, LISTED_PROBLEMS)]),
+  ]
+
+  return `↳ ${parts.join(' · ')}`
+}
+
+export function recordCall(runId: string, input: ToolCallInput, outcome: CallOutcome) {
+  runCalls.set(runId, [...(runCalls.get(runId) ?? []), { input, outcome }])
+}
+
+// The run's calls, forgotten here once taken.
+export function takeRunCalls(runId: string) {
+  const calls = runCalls.get(runId) ?? []
+  runCalls.delete(runId)
+
+  return calls
+}
+
+export function callLogMode(configured: string | undefined): CallLogMode {
+  return configured === 'calls' || configured === 'debug' || configured === 'off'
+    ? configured
+    : 'run'
 }

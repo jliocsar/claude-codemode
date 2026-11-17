@@ -129,7 +129,7 @@ async function askPlugin(
   const callId = crypto.randomUUID()
   const { promise: answered, resolve: settle } = Promise.withResolvers<ToolAnswer>()
   pendingToolCalls.set(callId, { runId, settle })
-  const line = { callId, input: { ...input, tool }, ...options }
+  const line = { callId, runId, input: { ...input, tool }, ...options }
   process.stdout.write(`${TOOL_CALL_PREFIX}${JSON.stringify(line)}\n`)
   const answer = await answered
 

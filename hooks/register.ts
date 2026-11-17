@@ -18,7 +18,7 @@ import {
   stopServerRun,
 } from './server-connection'
 import { superviseServer } from './server-process'
-import { customConversationTools } from './tool-relay'
+import { customConversationTools, logRunSummary } from './tool-relay'
 
 // Code mode: one `run` tool replaces every tool that only moves data. The model
 // writes a TypeScript program, the codemode server (codemode/server.ts, a Bun
@@ -51,7 +51,7 @@ export const register: Register = (on) => {
 
     if ((await $.tool.list()).some(({ name }) => name === BUILT_IN_CODE_TOOL)) {
       active = false
-      $.ui.log("codemode: Claude Code's own Code Mode is on, so codemode stays off this session")
+      $.ui.log("Claude Code's own Code Mode is on, so codemode stays off this session")
       $.ui.invalidate('tool.describe')
 
       return started
@@ -114,12 +114,17 @@ export const register: Register = (on) => {
 
       if (reply === 'interrupted') {
         await stopServerRun($, server, runId)
+        await logRunSummary($, runId)
 
         return { deny: 'run interrupted: its program was stopped' }
       }
 
+      await logRunSummary($, runId)
+
       return { result: runResult(reply) }
     } catch (cause) {
+      await logRunSummary($, runId)
+
       return { deny: `codemode server unavailable: ${errorText(cause)}` }
     }
   })
@@ -203,10 +208,12 @@ async function followBackgroundRun($: EngineInterface, server: ServerState, runI
     })
   }
 
+  await logRunSummary($, runId)
+
   try {
     await $.prompt.submit({ text })
   } catch (cause) {
-    $.ui.log(`codemode: reporting background run ${runId} failed: ${errorText(cause)}`)
+    $.ui.log(`reporting background run ${runId} failed: ${errorText(cause)}`)
   }
 }
 
