@@ -35,10 +35,10 @@ main conversation, not the subagent. Interrupting a run stops its program. If
 the server or its VM dies (killed, out of memory, a crashed sidecar), it's started again on its
 own, with no need to restart the session.
 
-Each run ends with one dim row summing up the tool calls it made, such as
-`↳ $ ×7 · Read · Edit · edited src/a.ts +2 −1 · $ npm test — exit 1`; the model never reads it.
-`CLAUDE_CODEMODE_CALL_LOG=calls` shows a row per call instead, `debug` sends those to the debug log,
-and `off` drops them.
+The `run` row shows each program and what it returned. For more, `CLAUDE_CODEMODE_CALL_LOG=run` adds
+one dim row per run summing up its tool calls, such as
+`↳ $ ×7 · Read · Edit · edited src/a.ts +2 −1 · $ npm test — exit 1`; `calls` adds a row per call,
+and `debug` sends those to the debug log. The model never reads them.
 
 The VM's temporary files live in `$TMPDIR/claude-codemode/<server pid>/`, removed when the server
 stops, and swept by the next server when it was killed.

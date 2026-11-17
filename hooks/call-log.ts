@@ -1,8 +1,8 @@
-// What the person sees of the tool calls a program makes: the engine shows
-// only the `run` call itself, with no row for the Reads, Edits and commands
-// inside it. By default one dim row sums up a run when it ends; with
-// CLAUDE_CODEMODE_CALL_LOG=calls, a row per call. `$.ui.log` rows never reach
-// the model, and the engine leads each with the plugin's name.
+// Rows about the tool calls a program makes, off by default: the `run` row
+// already shows the program and what it returned, so a row more only repeats
+// it. CLAUDE_CODEMODE_CALL_LOG=run adds one dim row summing up each run,
+// `calls` a row per call. `$.ui.log` rows never reach the model, and the
+// engine leads each with the plugin's name.
 
 import type { EngineInterface } from 'claude-code'
 
@@ -11,8 +11,8 @@ type ToolCallInput = Parameters<EngineInterface['tool']['call']>[0]
 // How the call ended, as the relay saw it.
 export type CallOutcome = { denied: true } | { denied: false; isError: boolean; text: string }
 
-// CLAUDE_CODEMODE_CALL_LOG: `run` (a row per run, the default), `calls` (a
-// row per call), `debug` (a row per call, in the debug log alone) or `off`.
+// CLAUDE_CODEMODE_CALL_LOG: `off` (the default), `run` (a row per run),
+// `calls` (a row per call) or `debug` (a row per call, in the debug log alone).
 export type CallLogMode = 'run' | 'calls' | 'debug' | 'off'
 
 type CallRecord = { input: ToolCallInput; outcome: CallOutcome }
@@ -176,7 +176,7 @@ export function takeRunCalls(runId: string) {
 }
 
 export function callLogMode(configured: string | undefined): CallLogMode {
-  return configured === 'calls' || configured === 'debug' || configured === 'off'
+  return configured === 'run' || configured === 'calls' || configured === 'debug'
     ? configured
-    : 'run'
+    : 'off'
 }

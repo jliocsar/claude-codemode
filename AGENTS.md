@@ -16,7 +16,7 @@ hooks/run-tool.ts            # `run`'s name, schema, description, the tools it r
 hooks/server-process.ts      # spawns the server, and again whenever it exits
 hooks/server-connection.ts   # asks the server; checks, kills and replaces one that stopped answering
 hooks/tool-relay.ts          # runs the programs' tool calls and posts the answers back
-hooks/call-log.ts            # a dim transcript row per run summing up its calls (CLAUDE_CODEMODE_CALL_LOG)
+hooks/call-log.ts            # opt-in rows summing up a run's calls (CLAUDE_CODEMODE_CALL_LOG, off by default)
 hooks/run-owners.ts          # runs a subagent started: never backgrounded, Bash kept in the foreground
 hooks/codemode.test.ts       # `claude plugin test .`
 codemode/server.ts           # Bun child: socket server, runs by id, stopping them
@@ -122,8 +122,9 @@ protocol alone.
   where a killed server left them for good (1.2 GB measured). On start, directories whose pid no
   longer runs are swept.
 - A relayed `$.tool.call` gets no transcript row of its own, and an Edit no diff: only `run` shows
-  (seen in a live session). `call-log.ts` writes one `$.ui.log` row per run summing up its calls
-  (a row per call was a wall of rows), which the model never reads; the Edit and Write line counts
+  (seen in a live session). The `run` row already shows the program and its value, so the extra
+  rows `call-log.ts` writes are off by default: `CLAUDE_CODEMODE_CALL_LOG=run` sums up each run in
+  one `$.ui.log` row (a row per call, `calls`, was a wall of rows), which the model never reads; the Edit and Write line counts
   come from the input, not the result. The engine leads every `$.ui.log` row with `codemode:`
   already, so no text adds it. Tool call lines carry their `runId` for this.
 - A plugin's `$.prompt.submit` and `$.tool.call` act in the main loop, never a subagent's (only

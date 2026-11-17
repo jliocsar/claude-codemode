@@ -164,13 +164,13 @@ test('a row per call drops the leading cd and the plugin name the engine adds it
   expect(line).toBe('↳ $ npm pack x…')
 })
 
-test('the call log is a row per run unless set to calls, debug or off', () => {
-  expect([undefined, 'calls', 'debug', 'off', 'x'].map(callLogMode)).toEqual([
+test('the call log is off unless set to run, calls or debug', () => {
+  expect([undefined, 'run', 'calls', 'debug', 'x'].map(callLogMode)).toEqual([
+    'off',
     'run',
     'calls',
     'debug',
     'off',
-    'run',
   ])
 })
 test("a subagent's run keeps Bash in the foreground, so no notice reaches the parent session", () => {
