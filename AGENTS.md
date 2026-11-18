@@ -26,15 +26,18 @@ codemode/checker.ts          # warm TypeScript language service: type check, las
 codemode/guest.ts            # guestApi: the program's globals ($, read, write, edit, keep, tools), injected as source
 codemode/shorthands.ts       # host side of $, read, write, edit: quoting, relative paths, results parsed
 codemode/scratch.ts          # the server's own TMPDIR, gone servers' swept; imported first by server.ts
-codemode/vm.ts               # the VM, made again when it fails; context pool; host functions; tickets; keep
+codemode/vm.ts               # the VM, made again when it fails or its sidecar grows; context pool; host functions; tickets; keep
+codemode/sidecar-memory.ts   # the sidecar process and its resident memory, from /proc
 codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output
 codemode/image.ts            # returned pictures out of the value, PDF page pictures, zoom
 codemode/png.ts              # Bun.Image's RGBA PNGs to pixels and back, for the crop
 codemode/catalog.ts          # tool input types from the generated d.ts, type-check prelude, search
 codemode/server.spec.ts      # `bun test`; spec-harness.ts spawns the real server and plays the plugin
 codemode/shorthands.spec.ts  # the shorthands, keep, runs, cap, background pictures, scratch directory
+codemode/memory.spec.ts      # sidecar memory flat over hundreds of runs; recycled when idle; servers of its own
 codemode/spec-answers.ts     # the canned tool answers and fixture files the specs' stand-in engine uses
 codemode/package.json        # runtime deps only (secure-exec, typescript, zod), `bun install`ed on first session start
+                             # until node_modules/.codemode-installed says one finished: a cut-short install broke every start
 package.json                 # dev tooling only: oxlint, oxfmt, begone-slop, typescript, @types/bun
 .githooks/                   # pre-commit and pre-push, wired by `prepare`
 .claude/settings.json        # developing this repo only: refuses Bash commands that skip the hooks
@@ -112,6 +115,13 @@ protocol alone.
   context evaluates in ~9 ms against ~95 ms fresh, and a reset context is cold again (measured).
   A stopped run's context is disposed; contexts are disposed before their VM, which otherwise logs
   `ERR_AGENTOS_VM_FORCED_PROCESS_FINALIZE`.
+- Each evaluate leaves ~0.3 MB in the sidecar until its context is disposed, even `1` (measured):
+  sidecars reached 1.9 GB over a long session. So a context is retired after 50 runs
+  (`CODEMODE_CONTEXT_MAX_RUNS`); `memory.spec.ts` holds 400 runs under 40 MB of growth, against
+  ~120 MB without it. The sidecar never hands memory back to the OS, not even after `vm.dispose()`
+  and a new VM in it: only a new sidecar does. So when a run ends with none going and the sidecar
+  holds over 1 GB (`CODEMODE_SIDECAR_RECYCLE_MB`), the VM is made again in a new one; `keep` and
+  the runs are on the host and stay. Never while a run is going: its evaluate and tickets would go.
 - `$` is Bun Shell's API, not Bun: the guest is Secure Exec's V8, and a host-side `Bun.$` would
   skip every permission check. Each command is a relayed Bash call. Bash merges stderr into stdout
   and gives no exit code in its record: a failed command's text opens `Exit code N` (measured).

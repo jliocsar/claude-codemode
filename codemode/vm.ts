@@ -1,9 +1,7 @@
 // The Secure Exec VM the programs run in, side by side: made once, made again
 // when it fails, and the host functions a program reaches `tools` through.
 //
-// Each run takes a context of its own from a pool and gives it back after: a
-// warm context evaluates in ~9 ms against ~95 ms for a fresh call (measured).
-// They are not reset between runs, since a reset context is cold again.
+// Runs evaluate in pooled contexts (context-pool.ts).
 //
 // Secure Exec fails any one host call past 30 s, whatever its limits say
 // (measured), so a tool call hands the program a ticket, and the program waits
@@ -13,6 +11,7 @@ import { type Context, createVm, shutdown, type Vm } from 'secure-exec'
 import { z } from 'zod'
 import { type CatalogEntry, currentToolInputTypes, searchCatalog } from './catalog.ts'
 import { guestApi } from './guest.ts'
+import { sidecarProcess } from './sidecar-memory.ts'
 import { resolve } from 'node:path'
 import { type JsonValue, type ZoomRegion, zoomRegionSchema } from './image.ts'
 import { callTool, type ToolInput, toolInputSchema, zoomFile } from './relay.ts'
@@ -52,8 +51,8 @@ type Ticket = { runId: string; settled: Promise<Settled> }
 
 const HOST_WAIT_MS = Number(Bun.env['CODEMODE_HOST_WAIT_MS'] ?? 20_000)
 const VM_DISPOSE_WAIT_MS = 5_000
-// Idle contexts kept past this many are disposed.
-const MAX_IDLE_CONTEXTS = 4
+// A sidecar holding more than this is made again once no run is going.
+const SIDECAR_RECYCLE_BYTES = Number(Bun.env['CODEMODE_SIDECAR_RECYCLE_MB'] ?? 1024) * 1024 * 1024
 
 // A day: no limit in practice, and inside every timer's range. A run never
 // times out; the plugin moves a long one to the background instead.
@@ -76,23 +75,6 @@ export function vmInUse(runs: RunLookup) {
   return current
 }
 
-// An idle context, or a new one when every one is busy.
-export function takeContext(vmUsed: VmGeneration) {
-  const idle = vmUsed.idleContexts.pop()
-
-  return idle === undefined ? vmUsed.vm.createContext() : Promise.resolve(idle)
-}
-
-// A context back in the pool after its run, or disposed when the run was
-// stopped (it may have been mid host call) or the pool is full.
-export async function releaseContext(vmUsed: VmGeneration, context: Context, reusable: boolean) {
-  if (reusable && vmUsed.idleContexts.length < MAX_IDLE_CONTEXTS) {
-    vmUsed.idleContexts.push(context)
-  } else {
-    await context.dispose().catch(() => undefined)
-  }
-}
-
 // Replaces a VM that failed, once however many runs saw it fail. A VM that
 // cannot be made again ends the server, and the plugin starts a new one.
 export async function replaceVm(failed: VmGeneration, runs: RunLookup) {
@@ -100,11 +82,45 @@ export async function replaceVm(failed: VmGeneration, runs: RunLookup) {
     return
   }
 
+  await renewVm(failed, runs)
+}
+
+// Makes the VM again in a new sidecar when the sidecar holds more than
+// SIDECAR_RECYCLE_BYTES, and only while no run is going: a run's evaluate and
+// its tool calls' tickets would go with the old one. `keep` and the runs live
+// here on the host, so they stay.
+export async function recycleLargeSidecar(runs: RunLookup) {
+  const checked = current
+
+  if (checked === undefined || runs.running().length > 0) {
+    return
+  }
+
+  const [vmUsed, sidecar] = await Promise.all([checked, sidecarProcess()])
+  const residentBytes = sidecar?.residentBytes
+
+  // Checked again after the wait, with nothing awaited before renewing: a run
+  // that started meanwhile keeps the VM, and another recycle already made one.
+  if (
+    residentBytes === undefined ||
+    residentBytes < SIDECAR_RECYCLE_BYTES ||
+    runs.running().length > 0 ||
+    current !== checked
+  ) {
+    return
+  }
+
+  await renewVm(vmUsed, runs)
+}
+
+// The next VM, in a new sidecar. `current` points at it at once, so a run
+// that starts meanwhile waits for it rather than taking the old one.
+async function renewVm(old: VmGeneration, runs: RunLookup) {
   current = (async () => {
-    await Promise.race([disposeVm(failed), Bun.sleep(VM_DISPOSE_WAIT_MS)])
+    await Promise.race([disposeVm(old), Bun.sleep(VM_DISPOSE_WAIT_MS)])
     await shutdown().catch(() => undefined)
 
-    return startVm(failed.generation + 1, runs)
+    return startVm(old.generation + 1, runs)
   })()
 
   try {

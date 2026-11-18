@@ -4,15 +4,14 @@
 import type { Context } from 'secure-exec'
 import { z } from 'zod'
 import { buildTypeCheckPrelude, type CatalogEntry, currentToolInputTypes } from './catalog.ts'
+import { releaseContext, takeContext } from './context-pool.ts'
 import { stripTypes, typeErrors, withLastExpressionReturned } from './checker.ts'
 import { type JsonValue, type ModelImage, takeOutImages } from './image.ts'
 import {
   guestPrelude,
   NO_LIMIT_MS,
-  releaseContext,
   replaceVm,
   type RunLookup,
-  takeContext,
   type VmGeneration,
   vmInUse,
 } from './vm.ts'

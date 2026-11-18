@@ -17,7 +17,14 @@ import { warmUpChecker } from './checker.ts'
 import type { ModelImage } from './image.ts'
 import { type Program, type RunReply, runProgram } from './program.ts'
 import { forgetRun, settleToolCall, stopRunCalls, toolAnswerSchema } from './relay.ts'
-import { disposeVm, forgetTickets, type RunLookup, settledWithin, vmInUse } from './vm.ts'
+import {
+  disposeVm,
+  forgetTickets,
+  recycleLargeSidecar,
+  type RunLookup,
+  settledWithin,
+  vmInUse,
+} from './vm.ts'
 
 // A run still going past REPLY_WAIT_MS: the plugin asks `/wait` for it again.
 type PendingReply = { pendingRunId: string }
@@ -158,6 +165,7 @@ function startRun(request: Omit<Program, 'signal'>, maxRunMs: number | undefined
 
       forgetRun(runId)
       forgetTickets(runId)
+      void recycleLargeSidecar(runLookup)
     }
   })()
   runs.set(runId, {

@@ -15,6 +15,7 @@ import { answerToolCall } from './tool-relay'
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 const INSTALL_ERROR_CHARACTERS = 500
+const INSTALLED_MARKER = '.codemode-installed'
 // Kept for the debug log; the person reads describeServerExit's few words.
 const EXIT_REASON_CHARACTERS = 2_000
 // Bun.Image, which zooming needs, is in Bun 1.4 on.
@@ -43,9 +44,15 @@ async function requireBun($: EngineInterface) {
   }
 }
 
-// The server's packages, installed on first start.
+// The server's packages, installed on first start. Done is the marker an
+// install writes once it succeeded, not a package being there: an install cut
+// short (sessions started side by side after an update, one closed mid-way)
+// left `secure-exec` without the packages it needs, and every later start
+// failed on `Cannot find module` (seen). `bun install` completes what is missing.
 async function installServer($: EngineInterface, serverDirectory: string) {
-  if (await $.fs.exists(`${serverDirectory}/node_modules/secure-exec`)) {
+  const installedMarker = `${serverDirectory}/node_modules/${INSTALLED_MARKER}`
+
+  if (await $.fs.exists(installedMarker)) {
     return
   }
 
@@ -57,6 +64,8 @@ async function installServer($: EngineInterface, serverDirectory: string) {
   if (installed.exitCode !== 0) {
     throw new Error(`bun install failed: ${installed.stderr.slice(-INSTALL_ERROR_CHARACTERS)}`)
   }
+
+  await $.fs.write(installedMarker, new Date().toISOString())
 }
 
 // Runs the server for the session's life: started again whenever it exits
