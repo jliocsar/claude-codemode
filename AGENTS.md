@@ -28,7 +28,8 @@ codemode/shorthands.ts       # host side of $, read, write, edit: quoting, relat
 codemode/scratch.ts          # the server's own TMPDIR, gone servers' swept; imported first by server.ts
 codemode/vm.ts               # the VM, made again when it fails or its sidecar grows; context pool; host functions; tickets; keep
 codemode/sidecar-memory.ts   # the sidecar process and its resident memory, from /proc
-codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output
+codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output; the call limit
+codemode/waiting.ts          # a promise waited on a while, durations as people say them, a call named in a message
 codemode/image.ts            # returned pictures out of the value, PDF page pictures, zoom
 codemode/png.ts              # Bun.Image's RGBA PNGs to pixels and back, for the crop
 codemode/catalog.ts          # tool input types from the generated d.ts, type-check prelude, search
