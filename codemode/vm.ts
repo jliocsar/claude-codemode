@@ -98,13 +98,13 @@ export async function recycleLargeSidecar(runs: RunLookup) {
   }
 
   const [vmUsed, sidecar] = await Promise.all([checked, sidecarProcess()])
-  const residentBytes = sidecar?.residentBytes
+  const heldBytes = sidecar?.heldBytes
 
   // Checked again after the wait, with nothing awaited before renewing: a run
   // that started meanwhile keeps the VM, and another recycle already made one.
   if (
-    residentBytes === undefined ||
-    residentBytes < SIDECAR_RECYCLE_BYTES ||
+    heldBytes === undefined ||
+    heldBytes < SIDECAR_RECYCLE_BYTES ||
     runs.running().length > 0 ||
     current !== checked
   ) {

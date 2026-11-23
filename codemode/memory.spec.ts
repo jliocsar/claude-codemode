@@ -138,7 +138,7 @@ test(
       const after = await currentSidecar(server)
 
       expect(after.pid).toBe(before.pid)
-      expect(after.residentBytes - before.residentBytes).toBeLessThan(ALLOWED_GROWTH_BYTES)
+      expect(after.heldBytes - before.heldBytes).toBeLessThan(ALLOWED_GROWTH_BYTES)
     } finally {
       server.child.kill('SIGTERM')
       await server.child.exited

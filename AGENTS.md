@@ -129,7 +129,8 @@ protocol alone.
   (`CODEMODE_CONTEXT_MAX_RUNS`); `memory.spec.ts` holds 400 runs under 40 MB of growth, against
   ~120 MB without it. The sidecar never hands memory back to the OS, not even after `vm.dispose()`
   and a new VM in it: only a new sidecar does. So when a run ends with none going and the sidecar
-  holds over 1 GB (`CODEMODE_SIDECAR_RECYCLE_MB`), the VM is made again in a new one; `keep` and
+  holds over 1 GB, resident plus swapped out (`CODEMODE_SIDECAR_RECYCLE_MB`; on a laptop short of
+  memory, resident alone read hundreds of MB low), the VM is made again in a new one; `keep` and
   the runs are on the host and stay. Never while a run is going: its evaluate and tickets would go,
   which is why a hung run has to end (above).
 - `$` is Bun Shell's API, not Bun: the guest is Secure Exec's V8, and a host-side `Bun.$` would
