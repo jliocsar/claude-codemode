@@ -26,7 +26,10 @@ pages) shows it to the model. `tools.zoom(filePath, { x, y, width, height })` sh
 image file at its own pixels, each enlarged to a block, for detail Read scales away. Every relayed call still goes through Claude Code's
 usual permissions.
 
-Nothing times out unless you set `CLAUDE_CODEMODE_MAX_RUN_MS`. A run still going after two minutes
+A tool call with no answer in 15 minutes fails with an error naming the call, and a run still going
+after two hours is stopped: a hung call otherwise held the VM's memory for hours.
+`CLAUDE_CODEMODE_MAX_TOOL_CALL_MS` and `CLAUDE_CODEMODE_MAX_RUN_MS` set others, in milliseconds, `0`
+for no limit. A run still going after two minutes
 moves to the background, the way a long Bash command does: the model gets its id at once and its
 result as a message when it ends, with any pictures it returned saved as files.
 `CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` sets another wait. In a subagent a run is waited out instead,

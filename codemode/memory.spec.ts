@@ -15,6 +15,7 @@ const MEASURED_RUNS_PER_LANE = 100
 const ALLOWED_GROWTH_BYTES = 40 * MB
 const RECYCLE_WAIT_MS = 15_000
 const SLOW_RUN_MS = 5_000
+const CATALOG = [{ name: 'mcp__notes__search', description: 'Search notes by keyword.' }]
 
 const readyLineSchema = z.object({ socketPath: z.string() })
 const replySchema = z.union([
@@ -44,10 +45,10 @@ async function startServer(env: Record<string, string>) {
   }
 
   // The run's text once it is done, asking `/wait` while it is going.
-  const run = async (code: string) => {
+  const run = async (code: string, limits: { maxToolCallMs?: number } = {}) => {
     let reply = await post(
       '/run',
-      JSON.stringify({ runId: crypto.randomUUID(), code, catalog: [] }),
+      JSON.stringify({ runId: crypto.randomUUID(), code, catalog: CATALOG, ...limits }),
     )
 
     while (reply.pendingRunId !== undefined) {
@@ -137,7 +138,7 @@ test(
       const after = await currentSidecar(server)
 
       expect(after.pid).toBe(before.pid)
-      expect(after.residentBytes - before.residentBytes).toBeLessThan(ALLOWED_GROWTH_BYTES)
+      expect(after.heldBytes - before.heldBytes).toBeLessThan(ALLOWED_GROWTH_BYTES)
     } finally {
       server.child.kill('SIGTERM')
       await server.child.exited
@@ -167,6 +168,36 @@ test(
       expect(await slow).toBe('slow')
       expect(await sidecarAfter(server, held)).toBeDefined()
       expect(await server.run("keep.get('answer')")).toBe('42')
+    } finally {
+      server.child.kill('SIGTERM')
+      await server.child.exited
+    }
+  },
+  { timeout: 120_000 },
+)
+
+test(
+  'a run hung on a tool call stops at its limit, and the sidecar it held is made again',
+  async () => {
+    // This server never answers a tool call: each one hangs.
+    const server = await startServer({
+      CODEMODE_SIDECAR_RECYCLE_MB: '1',
+      CODEMODE_REPLY_WAIT_MS: '100',
+    })
+
+    try {
+      const hung = server.run("await tools.call('mcp__notes__search', { query: 'x' })", {
+        maxToolCallMs: 2_000,
+      })
+      const held = await currentSidecar(server)
+      expect(await server.run('1 + 1')).toBe('2')
+      await Bun.sleep(500)
+      expect((await currentSidecar(server)).pid).toBe(held.pid)
+
+      expect(await hung).toMatch(
+        /^run failed: [^]*mcp__notes__search \{"query":"x"\} got no answer in 2 s/u,
+      )
+      expect(await sidecarAfter(server, held)).toBeDefined()
     } finally {
       server.child.kill('SIGTERM')
       await server.child.exited

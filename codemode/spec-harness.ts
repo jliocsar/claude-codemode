@@ -87,6 +87,7 @@ export async function run(
     inputs?: Record<string, string>
     cwd?: string
     maxRunMs?: number
+    maxToolCallMs?: number
     picturesToFiles?: boolean
   },
   runId = crypto.randomUUID(),
@@ -111,7 +112,8 @@ function answerToolCall(line: string) {
   seenToolCalls.push(input)
   const answerJson = JSON.stringify(cannedAnswer(callId, input))
 
-  if (input['query'] === STUCK_QUERY) {
+  // A stuck query, or a `$` command that names one, gets no answer.
+  if (input['query'] === STUCK_QUERY || input['command'] === `sleep ${STUCK_QUERY}`) {
     return
   }
 

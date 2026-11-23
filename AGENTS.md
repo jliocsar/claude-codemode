@@ -28,7 +28,8 @@ codemode/shorthands.ts       # host side of $, read, write, edit: quoting, relat
 codemode/scratch.ts          # the server's own TMPDIR, gone servers' swept; imported first by server.ts
 codemode/vm.ts               # the VM, made again when it fails or its sidecar grows; context pool; host functions; tickets; keep
 codemode/sidecar-memory.ts   # the sidecar process and its resident memory, from /proc
-codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output
+codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output; the call limit
+codemode/waiting.ts          # a promise waited on a while, durations as people say them, a call named in a message
 codemode/image.ts            # returned pictures out of the value, PDF page pictures, zoom
 codemode/png.ts              # Bun.Image's RGBA PNGs to pixels and back, for the crop
 codemode/catalog.ts          # tool input types from the generated d.ts, type-check prelude, search
@@ -79,10 +80,21 @@ protocol alone.
   30s`), whatever `limits.hostFunctions` or `limits.jsRuntime.syncRpcWaitTimeoutMs` say
   (measured). So `codemode.call` and `codemode.zoom` answer at once with a ticket, and the guest
   waits on it with `codemode.wait` in `HOST_WAIT_MS` (20 s) rounds.
-- Nothing times out: every VM limit is `NO_LIMIT_MS` (a day). A run still going after
-  `CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` (120 s) moves to the background: `run` answers with its id,
-  the plugin keeps asking `/wait`, and hands the model the reply with `$.prompt.submit`. Pictures
-  cannot travel in a plugin's prompt; the message counts them. `tools.stopRun(id)` stops one.
+- Every VM limit is `NO_LIMIT_MS` (a day): the server's own limits stop a run, not the VM. A run
+  still going after `CLAUDE_CODEMODE_BACKGROUND_AFTER_MS` (120 s) moves to the background: `run`
+  answers with its id, the plugin keeps asking `/wait`, and hands the model the reply with
+  `$.prompt.submit`. Pictures cannot travel in a plugin's prompt; the message counts them.
+  `tools.stopRun(id)` stops one.
+- A hung run must end. A run going grows its sidecar ~4 MB a minute (0.24 GB an hour), whether
+  it waits on a tool call in 20 s rounds, in 2 s rounds, or on a bare `setTimeout`, while an idle
+  sidecar stays flat (measured): the growth is Secure Exec's, per minute an evaluate is pending,
+  not per call. And one held a sidecar's recycling off for 6.6 h (an MCP call that never
+  returned), others 9 h and 3.5 h, while the sidecar grew to 1.5 GB (seen). So a relayed call with
+  no answer in 15 min fails (`CLAUDE_CODEMODE_MAX_TOOL_CALL_MS`), naming the call and how long it
+  waited; Bash stops itself by 10 min, so only a hung call gets there. A run is stopped after 2 h
+  (`CLAUDE_CODEMODE_MAX_RUN_MS`), naming the calls it still waited on. `0` turns either off; the
+  plugin sends them per run, the server holds the defaults. The plugin's own `$.tool.call` of a cut
+  call goes on (it takes no signal), and its late answer finds no call.
 - An interrupt `POST`s `/stop`: the run's waiting tool calls fail first, then the evaluate is
   aborted. An abort during a host call logs a sidecar panic (`RefCell already mutably borrowed`),
   yet the run still resolves `cancelled` and the VM keeps working (measured).
@@ -120,8 +132,10 @@ protocol alone.
   (`CODEMODE_CONTEXT_MAX_RUNS`); `memory.spec.ts` holds 400 runs under 40 MB of growth, against
   ~120 MB without it. The sidecar never hands memory back to the OS, not even after `vm.dispose()`
   and a new VM in it: only a new sidecar does. So when a run ends with none going and the sidecar
-  holds over 1 GB (`CODEMODE_SIDECAR_RECYCLE_MB`), the VM is made again in a new one; `keep` and
-  the runs are on the host and stay. Never while a run is going: its evaluate and tickets would go.
+  holds over 1 GB, resident plus swapped out (`CODEMODE_SIDECAR_RECYCLE_MB`; on a laptop short of
+  memory, resident alone read hundreds of MB low), the VM is made again in a new one; `keep` and
+  the runs are on the host and stay. Never while a run is going: its evaluate and tickets would go,
+  which is why a hung run has to end (above).
 - `$` is Bun Shell's API, not Bun: the guest is Secure Exec's V8, and a host-side `Bun.$` would
   skip every permission check. Each command is a relayed Bash call. Bash merges stderr into stdout
   and gives no exit code in its record: a failed command's text opens `Exit code N` (measured).

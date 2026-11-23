@@ -6,10 +6,13 @@
 
 import { readdir } from 'node:fs/promises'
 
-export type SidecarProcess = { pid: number; residentBytes: number }
+// `heldBytes`: resident and swapped out. A laptop short of memory swapped a
+// sidecar's pages out, and resident alone read hundreds of MB low (seen).
+export type SidecarProcess = { pid: number; heldBytes: number }
 
 const SIDECAR_NAME = /^agentos/u
 const RESIDENT_KB = /^VmRSS:\s+(\d+)\s+kB$/mu
+const SWAPPED_KB = /^VmSwap:\s+(\d+)\s+kB$/mu
 
 // The sidecar among the children of `parentPid` (this server by default);
 // undefined off Linux, or with no sidecar running.
@@ -17,12 +20,14 @@ export async function sidecarProcess(parentPid = process.pid) {
   try {
     for (const child of await childProcessIds(parentPid)) {
       const name = await Bun.file(`/proc/${child}/comm`).text()
-      const kilobytes = RESIDENT_KB.exec(await Bun.file(`/proc/${child}/status`).text())?.[1]
+      const status = await Bun.file(`/proc/${child}/status`).text()
+      const resident = RESIDENT_KB.exec(status)?.[1]
+      const swapped = SWAPPED_KB.exec(status)?.[1] ?? '0'
 
-      if (SIDECAR_NAME.test(name) && kilobytes !== undefined) {
+      if (SIDECAR_NAME.test(name) && resident !== undefined) {
         return {
           pid: Number(child),
-          residentBytes: Number(kilobytes) * 1024,
+          heldBytes: (Number(resident) + Number(swapped)) * 1024,
         } satisfies SidecarProcess
       }
     }

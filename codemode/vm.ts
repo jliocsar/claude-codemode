@@ -15,6 +15,7 @@ import { sidecarProcess } from './sidecar-memory.ts'
 import { resolve } from 'node:path'
 import { type JsonValue, type ZoomRegion, zoomRegionSchema } from './image.ts'
 import { callTool, type ToolInput, toolInputSchema, zoomFile } from './relay.ts'
+import { settledWithin } from './waiting.ts'
 import {
   type EditRequest,
   editFile,
@@ -97,13 +98,13 @@ export async function recycleLargeSidecar(runs: RunLookup) {
   }
 
   const [vmUsed, sidecar] = await Promise.all([checked, sidecarProcess()])
-  const residentBytes = sidecar?.residentBytes
+  const heldBytes = sidecar?.heldBytes
 
   // Checked again after the wait, with nothing awaited before renewing: a run
   // that started meanwhile keeps the VM, and another recycle already made one.
   if (
-    residentBytes === undefined ||
-    residentBytes < SIDECAR_RECYCLE_BYTES ||
+    heldBytes === undefined ||
+    heldBytes < SIDECAR_RECYCLE_BYTES ||
     runs.running().length > 0 ||
     current !== checked
   ) {
@@ -145,16 +146,6 @@ export function forgetTickets(runId: string) {
       tickets.delete(ticket)
     }
   }
-}
-
-// The promise's value if it settles within `ms`, else undefined.
-export async function settledWithin<Value>(promise: Promise<Value>, ms: number) {
-  const { promise: waited, resolve: stopWaiting } = Promise.withResolvers<undefined>()
-  const waitTimer = setTimeout(stopWaiting, ms, undefined)
-  const settled = await Promise.race([promise, waited])
-  clearTimeout(waitTimer)
-
-  return settled
 }
 
 async function startVm(generation: number, runs: RunLookup): Promise<VmGeneration> {

@@ -1,11 +1,12 @@
 // The shorthands (`$`, `read`, `write`, `edit`, `keep`), the last expression
 // as the value, and the run list, cap, background pictures and scratch
-// directory around them.
+// directory around them, and the limits that stop a hung run or call.
 
 import { readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'bun:test'
+import { formatDuration } from './waiting.ts'
 import {
   SHOT_BASE64,
   SHOT_PATH,
@@ -117,7 +118,7 @@ test(
 )
 
 test(
-  'tools.runs lists a run still going, and a capped run stops past its cap',
+  'tools.runs lists a run still going, and a run past its limit stops, naming the call it hung on',
   async () => {
     const runId = crypto.randomUUID()
     const capped = run(
@@ -141,10 +142,45 @@ test(
       code: 'await tools.call("mcp__notes__search", { query: "stuck" })',
     })
 
-    expect((await capped).text).toMatch(/^run failed: [^]*CLAUDE_CODEMODE_MAX_RUN_MS/u)
+    expect((await capped).text).toMatch(
+      /^run failed: [^]*it ran past its limit of 2 s \(CLAUDE_CODEMODE_MAX_RUN_MS\); it was still waiting \d+ s on mcp__notes__search \{"query":"stuck"\}/u,
+    )
   },
   TEST_TIMEOUT_MS,
 )
+
+test(
+  'a tool call with no answer past its limit fails, naming the call and how long it waited',
+  async () => {
+    const startedAt = Date.now()
+    const caught = await run({
+      code: `try {\n  await tools.call("mcp__notes__search", { query: "${STUCK_QUERY}" })\n} catch (error) {\n  return (error as Error).message\n}`,
+      maxToolCallMs: 1000,
+    })
+    const uncaught = await run({
+      code: `await $\`sleep ${STUCK_QUERY}\``,
+      maxToolCallMs: 1000,
+    })
+
+    expect(caught.text).toMatch(
+      /^mcp__notes__search \{"query":"stuck"\} got no answer in 1 s, so the program stopped waiting on it \(CLAUDE_CODEMODE_MAX_TOOL_CALL_MS\)/u,
+    )
+
+    expect(uncaught.text).toMatch(/^run failed: [^]*Bash sleep stuck got no answer in 1 s/u)
+
+    expect(Date.now() - startedAt).toBeLessThan(TEST_TIMEOUT_MS / 2)
+  },
+  TEST_TIMEOUT_MS,
+)
+
+test('durations read as people say them', () => {
+  expect([1_400, 90_000, 2 * 3_600_000, 23_760_000].map(formatDuration)).toEqual([
+    '1 s',
+    '2 min',
+    '2 h',
+    '6 h 36 min',
+  ])
+})
 
 test(
   "a background run's pictures are saved as files its text names",

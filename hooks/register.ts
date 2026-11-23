@@ -75,10 +75,11 @@ export const register: Register = (on) => {
       return { deny: 'run needs `code`: the body of an async TypeScript function' }
     }
 
-    const [catalog, backgroundAfterMs, maxRunMs, cwd] = await Promise.all([
+    const [catalog, backgroundAfterMs, maxRunMs, maxToolCallMs, cwd] = await Promise.all([
       relayedToolCatalog($, await customConversationTools($)),
       positiveMs($.env.get('CLAUDE_CODEMODE_BACKGROUND_AFTER_MS')),
-      positiveMs($.env.get('CLAUDE_CODEMODE_MAX_RUN_MS')),
+      limitMs($.env.get('CLAUDE_CODEMODE_MAX_RUN_MS')),
+      limitMs($.env.get('CLAUDE_CODEMODE_MAX_TOOL_CALL_MS')),
       $.session.cwd(),
     ])
     const runId = newRunId()
@@ -99,6 +100,7 @@ export const register: Register = (on) => {
         catalog,
         cwd,
         maxRunMs,
+        maxToolCallMs,
       })
       let reply = await ask('/run', runJson)
 
@@ -167,6 +169,24 @@ async function positiveMs(read: Promise<string | undefined>) {
     const configured = Number(await read)
 
     return Number.isFinite(configured) && configured > 0 ? configured : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// A limit in milliseconds from an environment variable, 0 for none; undefined
+// when unset or unreadable, for the server's default.
+async function limitMs(read: Promise<string | undefined>) {
+  try {
+    const configured = (await read)?.trim()
+
+    if (configured === undefined || configured === '') {
+      return undefined
+    }
+
+    const ms = Number(configured)
+
+    return Number.isFinite(ms) && ms >= 0 ? ms : undefined
   } catch {
     return undefined
   }

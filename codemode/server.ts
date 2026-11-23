@@ -16,20 +16,24 @@ import { catalogEntrySchema } from './catalog.ts'
 import { warmUpChecker } from './checker.ts'
 import type { ModelImage } from './image.ts'
 import { type Program, type RunReply, runProgram } from './program.ts'
-import { forgetRun, settleToolCall, stopRunCalls, toolAnswerSchema } from './relay.ts'
 import {
-  disposeVm,
-  forgetTickets,
-  recycleLargeSidecar,
-  type RunLookup,
-  settledWithin,
-  vmInUse,
-} from './vm.ts'
+  forgetRun,
+  limitToolCalls,
+  settleToolCall,
+  stopRunCalls,
+  toolAnswerSchema,
+  waitingCalls,
+} from './relay.ts'
+import { DEFAULT_TOOL_CALL_LIMIT_MS, formatDuration, settledWithin } from './waiting.ts'
+import { disposeVm, forgetTickets, recycleLargeSidecar, type RunLookup, vmInUse } from './vm.ts'
 
 // A run still going past REPLY_WAIT_MS: the plugin asks `/wait` for it again.
 type PendingReply = { pendingRunId: string }
 
 type FinishedReply = RunReply & { pendingRunId?: undefined }
+
+// In ms, 0 for no limit.
+type RunLimits = { runMs: number; toolCallMs: number }
 
 type Run = Pick<Program, 'catalog' | 'code' | 'cwd'> & {
   startedAt: number
@@ -44,6 +48,12 @@ const REPLY_WAIT_MS = Number(Bun.env['CODEMODE_REPLY_WAIT_MS'] ?? 20_000)
 const PARENT_CHECK_INTERVAL_MS = 5_000
 const LISTED_CODE_CHARACTERS = 80
 
+// How long a run may go, and a tool call in it wait for its answer, before
+// it is stopped, unless the plugin sends others (0 for none). Generous: a run
+// polling CI in the background goes on for an hour, while a call that hangs
+// (an MCP call that never returned, 6.6 h) is cut at 15 min.
+const DEFAULT_LIMITS: RunLimits = { runMs: 2 * 60 * 60_000, toolCallMs: DEFAULT_TOOL_CALL_LIMIT_MS }
+
 const PICTURE_EXTENSIONS = new Map([
   ['image/png', 'png'],
   ['image/jpeg', 'jpg'],
@@ -57,8 +67,10 @@ const runRequestSchema = z.object({
   inputs: z.record(z.string(), z.json()).optional(),
   catalog: z.array(catalogEntrySchema),
   cwd: z.string().optional(),
-  // CLAUDE_CODEMODE_MAX_RUN_MS, when set: the run is stopped past it.
-  maxRunMs: z.number().positive().optional(),
+  // CLAUDE_CODEMODE_MAX_RUN_MS and CLAUDE_CODEMODE_MAX_TOOL_CALL_MS when set,
+  // 0 for no limit; DEFAULT_LIMITS when not.
+  maxRunMs: z.number().nonnegative().optional(),
+  maxToolCallMs: z.number().nonnegative().optional(),
 })
 const runIdRequestSchema = z.object({ runId: z.string() })
 // A background run's reply travels as a prompt, where pictures cannot: they
@@ -92,14 +104,15 @@ const server = Bun.serve({
         const {
           inputs = {},
           cwd = '/',
-          maxRunMs,
+          maxRunMs = DEFAULT_LIMITS.runMs,
+          maxToolCallMs = DEFAULT_LIMITS.toolCallMs,
           ...program
         } = runRequestSchema.parse(await request.json())
 
         // The plugin names the run, so a `/run` it sends again after a lost
         // connection waits on the same program rather than starting another.
         if (!runs.has(program.runId)) {
-          startRun({ ...program, inputs, cwd }, maxRunMs)
+          startRun({ ...program, inputs, cwd }, { runMs: maxRunMs, toolCallMs: maxToolCallMs })
         }
 
         return Response.json(await replyWithin(program.runId))
@@ -140,15 +153,21 @@ const server = Bun.serve({
     ),
 })
 
-function startRun(request: Omit<Program, 'signal'>, maxRunMs: number | undefined) {
+// A stopped run's evaluate and its contexts free the sidecar again: a run
+// that hung for hours held off its recycling the whole time (seen).
+function startRun(request: Omit<Program, 'signal'>, limits: RunLimits) {
   const { runId } = request
   const stopper = new AbortController()
+  limitToolCalls(runId, limits.toolCallMs)
   const capTimer =
-    maxRunMs === undefined
+    limits.runMs === 0
       ? undefined
       : setTimeout(() => {
-          stopRun(runId, `it ran past CLAUDE_CODEMODE_MAX_RUN_MS (${maxRunMs} ms)`)
-        }, maxRunMs)
+          stopRun(
+            runId,
+            `it ran past its limit of ${formatDuration(limits.runMs)} (CLAUDE_CODEMODE_MAX_RUN_MS)`,
+          )
+        }, limits.runMs)
   const reply = (async () => {
     try {
       return await runProgram({ ...request, signal: stopper.signal }, runLookup)
@@ -214,8 +233,12 @@ function stopRun(runId: string, reason: string) {
     return false
   }
 
-  stopRunCalls(runId, reason)
-  run.stopper.abort(reason)
+  // Named before stopRunCalls fails them.
+  const waiting = waitingCalls(runId)
+  const why =
+    waiting.length === 0 ? reason : `${reason}; it was still waiting ${waiting.join(', ')}`
+  stopRunCalls(runId, why)
+  run.stopper.abort(why)
 
   return true
 }
