@@ -9,6 +9,12 @@ import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, sep } from 'node:path'
 import { z } from 'zod'
 import { type JsonValue, withPageImages, type ZoomRegion, zoomImage } from './image.ts'
+import {
+  DEFAULT_TOOL_CALL_LIMIT_MS,
+  describeCall,
+  formatDuration,
+  settledWithin,
+} from './waiting.ts'
 
 export type ToolInput = z.infer<typeof toolInputSchema>
 
@@ -19,7 +25,13 @@ type AnsweredToolCall = Extract<ToolAnswer, { outcome: 'answered' }>
 // What a program's `tools.call` resolves with.
 type ToolCallReply = { text: string; isError: boolean; result: JsonValue }
 
-type PendingToolCall = { runId: string; settle: (answer: ToolAnswer) => void }
+// `what` names the call in a message: the tool, and its command or file.
+type PendingToolCall = {
+  runId: string
+  what: string
+  startedAt: number
+  settle: (answer: ToolAnswer) => void
+}
 
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 // Lines per Read page when a file is past Read's own size cap.
@@ -65,6 +77,22 @@ const pagedReadInputSchema = z.looseObject({
 const pendingToolCalls = new Map<string, PendingToolCall>()
 // Runs that were stopped: their calls fail rather than reach the plugin.
 const stoppedRuns = new Map<string, string>()
+// Each run's tool call limit in ms, 0 for none.
+const toolCallLimits = new Map<string, number>()
+
+// How long a call of this run may go unanswered; 0 for no limit.
+export function limitToolCalls(runId: string, limitMs: number) {
+  toolCallLimits.set(runId, limitMs)
+}
+
+// The run's calls still waiting, longest first, as a message names them:
+// `6 h 36 min on mcp__notes__search {"query":"x"}`.
+export function waitingCalls(runId: string) {
+  return [...pendingToolCalls.values()]
+    .filter((pending) => pending.runId === runId)
+    .toSorted((first, second) => first.startedAt - second.startedAt)
+    .map(({ what, startedAt }) => `${formatDuration(Date.now() - startedAt)} on ${what}`)
+}
 
 // One tool call of a run, with long output whole and a file past Read's size cap read in pages.
 export async function callTool(runId: string, tool: string, input: ToolInput) {
@@ -88,6 +116,7 @@ export function stopRunCalls(runId: string, reason: string) {
 
 export function forgetRun(runId: string) {
   stoppedRuns.delete(runId)
+  toolCallLimits.delete(runId)
 }
 
 export function settleToolCall(answer: ToolAnswer) {
@@ -127,11 +156,22 @@ async function askPlugin(
   }
 
   const callId = crypto.randomUUID()
+  const what = describeCall(tool, input)
   const { promise: answered, resolve: settle } = Promise.withResolvers<ToolAnswer>()
-  pendingToolCalls.set(callId, { runId, settle })
+  pendingToolCalls.set(callId, { runId, what, startedAt: Date.now(), settle })
   const line = { callId, runId, input: { ...input, tool }, ...options }
   process.stdout.write(`${TOOL_CALL_PREFIX}${JSON.stringify(line)}\n`)
-  const answer = await answered
+  const limitMs = toolCallLimits.get(runId) ?? DEFAULT_TOOL_CALL_LIMIT_MS
+  const answer = limitMs > 0 ? await settledWithin(answered, limitMs) : await answered
+
+  if (answer === undefined) {
+    // The plugin may still answer it later: settleToolCall finds no call then.
+    pendingToolCalls.delete(callId)
+
+    throw new Error(
+      `${what} got no answer in ${formatDuration(limitMs)}, so the program stopped waiting on it (CLAUDE_CODEMODE_MAX_TOOL_CALL_MS). It may still be running in the session: check what it did before calling it again.`,
+    )
+  }
 
   if (answer.outcome === 'answered') {
     return answer
