@@ -85,7 +85,10 @@ protocol alone.
   answers with its id, the plugin keeps asking `/wait`, and hands the model the reply with
   `$.prompt.submit`. Pictures cannot travel in a plugin's prompt; the message counts them.
   `tools.stopRun(id)` stops one.
-- A hung run must end: one held a sidecar's recycling off for 6.6 h (an MCP call that never
+- A hung run must end. A run going grows its sidecar ~4 MB a minute (0.24 GB an hour), whether
+  it waits on a tool call in 20 s rounds, in 2 s rounds, or on a bare `setTimeout`, while an idle
+  sidecar stays flat (measured): the growth is Secure Exec's, per minute an evaluate is pending,
+  not per call. And one held a sidecar's recycling off for 6.6 h (an MCP call that never
   returned), others 9 h and 3.5 h, while the sidecar grew to 1.5 GB (seen). So a relayed call with
   no answer in 15 min fails (`CLAUDE_CODEMODE_MAX_TOOL_CALL_MS`), naming the call and how long it
   waited; Bash stops itself by 10 min, so only a hung call gets there. A run is stopped after 2 h
