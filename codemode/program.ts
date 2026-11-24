@@ -42,6 +42,18 @@ const VM_FAILURE =
   /SidecarProcessExited|sidecar process exited|ERR_AGENTOS_REQUEST_TASK_PANIC|ERR_AGENTOS_VM/u
 
 const DISK_FULL = /No space left on device|ENOSPC/u
+
+// Secure Exec prints this on every evaluate in a context used before: it
+// defines the host functions again and finds the first ones there. Noise, and
+// read first it hid the real failure (seen).
+const HOST_GROUP_NOTICE =
+  /^agentos: host function group "[^"]+" was not defined because globalThis\.\S+ already exists\n?/gmu
+
+// Secure Exec gave up on an evaluate whose program was still going: with runs
+// side by side, one ended early on a missing result file while its program
+// kept running in the context, and the next run there never finished
+// (measured). That context is lost, not the run's program at fault.
+const LOST_EVALUATION = /no structured result|ERR_LATE_STREAM_EVENT/u
 const MAY_HAVE_RUN = 'It may have partly run: check what it did before running it again.'
 
 const jsonValueSchema = z.json()
@@ -136,7 +148,9 @@ async function evaluate(
     return { ok: false, feedback: vmFailureFeedback(String(cause)), stdout: '' }
   }
 
-  await releaseContext(vmUsed, context, ran.outcome !== 'cancelled')
+  // Only a context whose evaluate succeeded goes back to the pool: one that
+  // failed may still hold its program, and a run handed it never finishes.
+  await releaseContext(vmUsed, context, ran.outcome === 'succeeded')
   const stdout = ran.stdout ?? ''
 
   if (ran.outcome === 'succeeded') {
@@ -149,8 +163,16 @@ async function evaluate(
     return { ok: false, feedback: `stopped: ${String(signal.reason)}`, stdout }
   }
 
-  const stderr = ran.stderr ?? ''
+  const stderr = (ran.stderr ?? '').replace(HOST_GROUP_NOTICE, '').trim()
   const failure = stderr === '' ? ran.error.message : stderr
+
+  if (LOST_EVALUATION.test(`${ran.error.message}\n${failure}`)) {
+    return {
+      ok: false,
+      feedback: `the VM lost track of the run before it ended (${ran.error.message}). ${MAY_HAVE_RUN}`,
+      stdout,
+    }
+  }
 
   if (!VM_FAILURE.test(failure)) {
     return { ok: false, feedback: failure, stdout }
