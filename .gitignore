@@ -3,3 +3,5 @@ node_modules/
 tmp/
 .claude/worktrees/
 *.tsbuildinfo
+codemode/.install-lock/
+codemode/.install-tmp/

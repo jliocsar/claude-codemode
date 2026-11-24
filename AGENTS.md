@@ -26,6 +26,7 @@ codemode/checker.ts          # warm TypeScript language service: type check, las
 codemode/guest.ts            # guestApi: the program's globals ($, read, write, edit, keep, tools), injected as source
 codemode/shorthands.ts       # host side of $, read, write, edit: quoting, relative paths, results parsed
 codemode/scratch.ts          # the server's own TMPDIR, gone servers' swept; imported first by server.ts
+codemode/install.ts          # `bun install` once per plugin directory: a pid lock, Bun's unpacking in our own dir
 codemode/vm.ts               # the VM, made again when it fails or its sidecar grows; context pool; host functions; tickets; keep
 codemode/sidecar-memory.ts   # the sidecar process and its resident memory, from /proc
 codemode/relay.ts            # tool calls out as stdout lines, answers in from `/answer`; whole output; the call limit
@@ -36,6 +37,7 @@ codemode/catalog.ts          # tool input types from the generated d.ts, type-ch
 codemode/server.spec.ts      # `bun test`; spec-harness.ts spawns the real server and plays the plugin
 codemode/shorthands.spec.ts  # the shorthands, keep, runs, cap, background pictures, scratch directory
 codemode/memory.spec.ts      # sidecar memory flat over hundreds of runs; recycled when idle; servers of its own
+codemode/install.spec.ts     # one install for sessions started together; a killed one's lock and leftovers taken over
 codemode/spec-answers.ts     # the canned tool answers and fixture files the specs' stand-in engine uses
 codemode/package.json        # runtime deps only (secure-exec, typescript, zod), `bun install`ed on first session start
                              # until node_modules/.codemode-installed says one finished: a cut-short install broke every start
@@ -105,6 +107,12 @@ protocol alone.
   SIGKILL 3 s later, and the request goes to the next one, except a `/run`: a program that killed
   its own server ran again on the next and killed it too (measured), so that run reads as failed.
   A run lost with its server reads `no run <id> here`.
+- The install runs as `bun install.ts` with `$.process.run`'s longest timeout (10 min): its default
+  30 s cut every cold-cache install (1.2 GB of sidecar binaries), so none finished, every session
+  start tried again, and Bun left each package it was unpacking half-written in /tmp for good
+  (25 of them, 4.5 GB, seen). install.ts holds a lock directory with its pid, so sessions started
+  together wait for one install, and points `BUN_TMPDIR` at `codemode/.install-tmp`, removed
+  when the install ends and before the next one.
 - The server is spawned by its absolute path: a `pkill -f "bun server.ts"` once killed every
   session's server at once.
 - Long output arrives whole: the engine cuts a long result to a `<persisted-output>` preview (Bash's

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test ./server.spec.ts ./shorthands.spec.ts ./memory.spec.ts"
+    "test": "bun test ./server.spec.ts ./shorthands.spec.ts ./memory.spec.ts ./install.spec.ts"
   },
   "dependencies": {
     "secure-exec": "0.2.22",

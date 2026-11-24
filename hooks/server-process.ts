@@ -15,7 +15,12 @@ import { answerToolCall } from './tool-relay'
 const READY_PREFIX = 'CODEMODE_READY '
 const TOOL_CALL_PREFIX = 'CODEMODE_TOOL_CALL '
 const INSTALL_ERROR_CHARACTERS = 500
-const INSTALLED_MARKER = '.codemode-installed'
+// Written by codemode/install.ts once an install succeeded.
+const INSTALLED_MARKER = 'node_modules/.codemode-installed'
+// `$.process.run` kills a command at 30 s unless told otherwise, and a cold
+// Bun cache downloads 1.2 GB of sidecar binaries: every install was cut short,
+// and every session start tried again (seen). Ten minutes is its most.
+const INSTALL_TIMEOUT_MS = 600_000
 // Kept for the debug log; the person reads describeServerExit's few words.
 const EXIT_REASON_CHARACTERS = 2_000
 // Bun.Image, which zooming needs, is in Bun 1.4 on.
@@ -48,24 +53,22 @@ async function requireBun($: EngineInterface) {
 // install writes once it succeeded, not a package being there: an install cut
 // short (sessions started side by side after an update, one closed mid-way)
 // left `secure-exec` without the packages it needs, and every later start
-// failed on `Cannot find module` (seen). `bun install` completes what is missing.
+// failed on `Cannot find module` (seen). install.ts runs one `bun install` at
+// a time for the directory, and cleans up what Bun unpacks.
 async function installServer($: EngineInterface, serverDirectory: string) {
-  const installedMarker = `${serverDirectory}/node_modules/${INSTALLED_MARKER}`
-
-  if (await $.fs.exists(installedMarker)) {
+  if (await $.fs.exists(`${serverDirectory}/${INSTALLED_MARKER}`)) {
     return
   }
 
   $.ui.toast('codemode: installing the server (first start only)')
-  const installed = await $.process.run(['bun', 'install', '--frozen-lockfile'], {
+  const installed = await $.process.run(['bun', `${serverDirectory}/install.ts`], {
     cwd: serverDirectory,
+    timeoutMs: INSTALL_TIMEOUT_MS,
   })
 
   if (installed.exitCode !== 0) {
     throw new Error(`bun install failed: ${installed.stderr.slice(-INSTALL_ERROR_CHARACTERS)}`)
   }
-
-  await $.fs.write(installedMarker, new Date().toISOString())
 }
 
 // Runs the server for the session's life: started again whenever it exits
